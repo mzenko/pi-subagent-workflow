@@ -1,0 +1,72 @@
+{
+  "name": "pi-subagent-workflow",
+  "version": "0.1.0",
+  "description": "Ad-hoc composable subagents and Claude Code-style dynamic workflow orchestration for pi. No personas, no registries - workers composed on the fly.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "extensions/",
+    "skills/",
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "bun run build",
+    "test": "bun test tests/",
+    "test:e2e": "bun test e2e/ --timeout 300000"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "subagents",
+    "workflow",
+    "orchestration",
+    "multi-agent",
+    "fan-out",
+    "claude-code"
+  ],
+  "pi": {
+    "extensions": [
+      "extensions/subagent-workflow.ts"
+    ]
+  },
+  "author": "Matt Zenko",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mzenko/pi-subagent-workflow.git"
+  },
+  "homepage": "https://github.com/mzenko/pi-subagent-workflow#readme",
+  "bugs": {
+    "url": "https://github.com/mzenko/pi-subagent-workflow/issues"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": ">=0.80.6",
+    "@earendil-works/pi-tui": ">=0.80.6",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.80.6",
+    "@earendil-works/pi-coding-agent": "0.80.6",
+    "@earendil-works/pi-tui": "0.80.6",
+    "@types/bun": "latest",
+    "typebox": "latest",
+    "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "acorn": "^8.17.0"
+  }
+}
