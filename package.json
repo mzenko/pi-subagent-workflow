@@ -20,7 +20,7 @@
   ],
   "scripts": {
     "check": "tsc --noEmit",
-    "build": "tsc -p tsconfig.build.json",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "prepack": "bun run build",
     "test": "bun test tests/",
     "test:e2e": "bun test e2e/ --timeout 300000"
