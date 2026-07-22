@@ -1,6 +1,6 @@
 {
   "name": "pi-subagent-workflow",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Ad-hoc composable subagents and Claude Code-style dynamic workflow orchestration for pi. No personas, no registries - workers composed on the fly.",
   "type": "module",
   "main": "./dist/index.js",
