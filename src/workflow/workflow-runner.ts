@@ -458,7 +458,13 @@ export function startParsedWorkflow(
     }
   });
   try {
-    runner.registerRunController(runId, runController, parent.ctx.sessionManager.getSessionId(), execution);
+    runner.registerRunController(
+      runId,
+      runController,
+      parent.ctx.sessionManager.getSessionId(),
+      execution,
+      (error) => error instanceof WorkflowRunError && error.status === "aborted",
+    );
   } catch (error) {
     runController.abort();
     try { unbindExternalAbort(); } catch {}

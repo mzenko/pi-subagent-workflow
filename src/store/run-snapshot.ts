@@ -194,9 +194,8 @@ function referencesUnrecordedChild(
   return false;
 }
 
-function jsonObject(value: FrozenJson | undefined): { readonly [key: string]: FrozenJson } | undefined {
-  if (!isRecord(value)) return undefined;
-  return value as { readonly [key: string]: FrozenJson };
+export function jsonObject(value: unknown): Record<string, unknown> | undefined {
+  return isRecord(value) ? value : undefined;
 }
 
 function freezeJson(value: unknown): FrozenJson {

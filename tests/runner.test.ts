@@ -12,6 +12,7 @@ import { hasSessionClosedMarker } from "../src/store/session-closed-marker.js";
 import { resolveFollowUpSpec } from "../src/tool/subagent-tool.js";
 import type { ParentContext, ResolvedFollowUpSpec } from "../src/runner/child.js";
 import type { ResolvedSpec, SubagentHandle, SubagentResult, SubagentSpec } from "../src/types.js";
+import { WorkflowRunError } from "../src/workflow/workflow-runner.js";
 
 const zeroUsage = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 });
 
@@ -1369,6 +1370,70 @@ test("session disposal aborts workflow controllers owned by that parent session"
   expect(disposed).toBe(true);
 });
 
+test("session disposal propagates unexpected workflow failures but ignores expected aborts", async () => {
+  const runner = new SubagentRunner(async () => { throw new Error("not used"); }, new Semaphore(1), temporaryStore);
+  const isExpectedStop = (error: unknown) => error instanceof WorkflowRunError && error.status === "aborted";
+  const unexpected = new WorkflowRunError("unexpected workflow failure", "workflow-failed", "/tmp/workflow-failed");
+  const failedExecution = Promise.reject(unexpected);
+  void failedExecution.catch(() => undefined);
+  runner.registerRunController("workflow-failed", new AbortController(), "parent", failedExecution, isExpectedStop);
+
+  const failure = await runner.disposeForSession("parent").then(() => undefined, (error: unknown) => error);
+  expect(failure).toBe(unexpected);
+  runner.unregisterRunController("workflow-failed");
+
+  const expected = new WorkflowRunError("Workflow stopped", "workflow-aborted", "/tmp/workflow-aborted", undefined, [], undefined, "aborted");
+  const abortedExecution = Promise.reject(expected);
+  void abortedExecution.catch(() => undefined);
+  runner.registerRunController("workflow-aborted", new AbortController(), "parent", abortedExecution, isExpectedStop);
+
+  await expect(runner.disposeForSession("parent")).resolves.toBeUndefined();
+});
+
+test("session disposal awaits sibling handles before rethrowing a disposal failure", async () => {
+  const runner = new SubagentRunner(async () => { throw new Error("not used"); }, new Semaphore(1), temporaryStore);
+  const parent = runnerParent();
+  const disposalError = new Error("handle disposal failed");
+  let reportSiblingStarted!: () => void;
+  const siblingStarted = new Promise<void>((resolve) => { reportSiblingStarted = resolve; });
+  let releaseSibling!: () => void;
+  const siblingGate = new Promise<void>((resolve) => { releaseSibling = resolve; });
+  type DisposableHandle = {
+    parent: ParentContext;
+    runId: string;
+    dispose: () => Promise<void>;
+    waitForStartup: () => Promise<void>;
+    readonly isTerminal: boolean;
+  };
+  const handles = (runner as unknown as { handles: Map<string, DisposableHandle> }).handles;
+  handles.set("failing", {
+    parent,
+    runId: "run-disposal",
+    dispose: async () => { throw disposalError; },
+    waitForStartup: async () => {},
+    isTerminal: false,
+  });
+  handles.set("sibling", {
+    parent,
+    runId: "run-disposal",
+    dispose: async () => { reportSiblingStarted(); await siblingGate; },
+    waitForStartup: async () => {},
+    isTerminal: false,
+  });
+
+  let settled = false;
+  const shutdown = runner.disposeForSession("parent")
+    .then(() => undefined, (error: unknown) => error)
+    .finally(() => { settled = true; });
+  await siblingStarted;
+  await Promise.resolve();
+  expect(settled).toBe(false);
+
+  releaseSibling();
+  expect(await shutdown).toBe(disposalError);
+  expect(settled).toBe(true);
+});
+
 test("stopRun waits for the registered workflow execution to release ownership", async () => {
   const runner = new SubagentRunner(async () => { throw new Error("not used"); }, new Semaphore(1), temporaryStore);
   const controller = new AbortController();
@@ -1423,6 +1488,76 @@ test("workflow children dispose on completion", async () => {
 function temporaryStore(runId: string, parent: ParentContext): RunStore {
   return new RunStore(runId, parent.ctx.cwd, "parent", undefined, { rootDir: mkdtempSync(join(tmpdir(), "subagent-runner-")) });
 }
+
+test("a user abort cannot become late structured schema success", async () => {
+  const resolved: ResolvedSpec = { provider: "test", modelId: "tiny", thinkingLevel: "off", tools: ["report_result"], cwd: "/tmp", label: "schema abort race" };
+  const capture = { called: false, value: undefined as unknown };
+  let reportPromptStarted!: () => void;
+  const promptStarted = new Promise<void>((resolve) => { reportPromptStarted = resolve; });
+  let finishPrompt!: () => void;
+  const promptGate = new Promise<void>((resolve) => { finishPrompt = resolve; });
+  let latestAssistant: Record<string, unknown> | undefined;
+  const session = {
+    sessionFile: "/schema-user-abort.jsonl",
+    get latestAssistant() { return latestAssistant as never; },
+    usage: zeroUsage(),
+    subscribe: () => () => {},
+    prompt: async () => { reportPromptStarted(); await promptGate; },
+    steer: async () => {},
+    abort: async () => {
+      capture.called = true;
+      capture.value = { answer: "too late" };
+      latestAssistant = { role: "assistant", content: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } }, stopReason: "aborted" };
+      finishPrompt();
+    },
+    dispose: async () => {},
+  } as unknown as ChildSession;
+  const runner = new SubagentRunner(async () => ({ session, resolved, schemaCapture: capture }), new Semaphore(1), temporaryStore);
+  const handle = runner.spawn({ prompt: "answer", schema: { type: "object" } }, runnerParent());
+  await promptStarted;
+
+  await handle.abort();
+  const result = await handle.result;
+
+  expect(result.status).toBe("aborted");
+  expect(result.structured).toBeUndefined();
+});
+
+test("an externally cancelled prompt rejection returns aborted with its latest assistant text", async () => {
+  const resolved: ResolvedSpec = { provider: "test", modelId: "tiny", thinkingLevel: "off", tools: [], cwd: "/tmp", label: "prompt rejection" };
+  let reportPromptStarted!: () => void;
+  const promptStarted = new Promise<void>((resolve) => { reportPromptStarted = resolve; });
+  let rejectPrompt!: (error: Error) => void;
+  const promptGate = new Promise<void>((_resolve, reject) => { rejectPrompt = reject; });
+  let latestAssistant: Record<string, unknown> | undefined;
+  const session = {
+    sessionFile: "/prompt-rejection.jsonl",
+    get latestAssistant() { return latestAssistant as never; },
+    usage: zeroUsage(),
+    subscribe: () => () => {},
+    prompt: async () => { reportPromptStarted(); await promptGate; },
+    steer: async () => {},
+    abort: async () => {
+      latestAssistant = {
+        role: "assistant",
+        content: [{ type: "text", text: "partial answer" }],
+        usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+        stopReason: "aborted",
+      };
+      rejectPrompt(new Error("child channel closed"));
+    },
+    dispose: async () => {},
+  } as unknown as ChildSession;
+  const runner = new SubagentRunner(async () => ({ session, resolved }), new Semaphore(1), temporaryStore);
+  const handle = runner.spawn({ prompt: "answer" }, runnerParent());
+  await promptStarted;
+
+  await handle.abort();
+  const result = await handle.result;
+
+  expect(result).toMatchObject({ status: "aborted", text: "partial answer" });
+  expect(result.error).toBeUndefined();
+});
 
 test("a schema child that self-terminates through report_result returns completed with its structured value", async () => {
   const resolved: ResolvedSpec = { provider: "test", modelId: "tiny", thinkingLevel: "off", tools: [], cwd: "/tmp", label: "schema" };

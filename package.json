@@ -16,8 +16,7 @@
     "extensions/",
     "skills/",
     "src/",
-    "README.md",
-    "LICENSE"
+    "README.md"
   ],
   "scripts": {
     "check": "tsc --noEmit",
@@ -44,14 +43,6 @@
   },
   "author": "Matt Zenko",
   "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/mzenko/pi-subagent-workflow.git"
-  },
-  "homepage": "https://github.com/mzenko/pi-subagent-workflow#readme",
-  "bugs": {
-    "url": "https://github.com/mzenko/pi-subagent-workflow/issues"
-  },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": ">=0.80.6",

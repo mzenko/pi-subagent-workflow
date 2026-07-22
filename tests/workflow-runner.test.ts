@@ -15,7 +15,7 @@ import { JournalUnreadableError } from "../src/workflow/journal.js";
 import { parseWorkflowScript } from "../src/workflow/parser.js";
 import { formatWorkflowResult } from "../src/workflow/launch.js";
 import { findLatestCompletedWorkflowRun, findWorkflowRunById, resolveRunDir } from "../src/workflow/saved.js";
-import { WORKFLOW_AGENT_CAP, normalizeArgs, runWorkflow, startParsedWorkflow } from "../src/workflow/workflow-runner.js";
+import { WORKFLOW_AGENT_CAP, WorkflowRunError, normalizeArgs, runWorkflow, startParsedWorkflow } from "../src/workflow/workflow-runner.js";
 
 const parent = { ctx: { cwd: "/work", model: { provider: "test", id: "parent-model" }, sessionManager: { getSessionId: () => "parent", getSessionFile: () => "/parent.jsonl" } }, thinkingLevel: "off", selfPath: "/extension.ts" } as unknown as ParentContext;
 
@@ -23,16 +23,17 @@ class FakeRunner {
   calls: SubagentSpec[] = [];
   delivered: string[] = [];
   controllers = new Map<string, AbortController>();
-  registrations: Array<{ runId: string; parentSessionId?: string }> = [];
+  registrations: Array<{ runId: string; parentSessionId?: string; isExpectedStop?: (error: unknown) => boolean }> = [];
   stores = new Map<string, RunStore>();
   resultFactory?: (spec: SubagentSpec, number: number) => Promise<SubagentResult>;
   abortFactory?: (spec: SubagentSpec, number: number) => Promise<void>;
   /** When set, abort the run controller as soon as this many agents have spawned. */
   stopAfter = Number.POSITIVE_INFINITY;
   markDelivered(runId: string): void { this.delivered.push(runId); }
-  registerRunController(runId: string, controller: AbortController, parentSessionId?: string, _execution?: Promise<unknown>): void {
+  registerRunController(runId: string, controller: AbortController, parentSessionId?: string, _execution?: Promise<unknown>,
+    isExpectedStop?: (error: unknown) => boolean): void {
     this.controllers.set(runId, controller);
-    this.registrations.push({ runId, parentSessionId });
+    this.registrations.push({ runId, parentSessionId, isExpectedStop });
   }
   unregisterRunController(runId: string): void { this.controllers.delete(runId); }
   isRunActive(runId: string): boolean { return this.controllers.has(runId); }
@@ -1299,14 +1300,18 @@ test("malformed persisted children refuse resume and release ownership", async (
   expect(probeSqliteLock(join(first.runDir, "owner.sqlite"))).toBe("free");
 });
 
-test("workflow controller registration carries its parent session id", async () => {
+test("workflow controller registration carries its owner and expected-stop classifier", async () => {
   const runner = new FakeRunner();
   const script = "export const meta = { name: 'controller-owner', description: 'test' }; return 1;";
   await runWorkflow({ script }, parent, {
     rootDir: mkdtempSync(join(tmpdir(), "workflow-controller-owner-")),
     runner: runner as never,
   });
-  expect(runner.registrations[0]?.parentSessionId).toBe("parent");
+  const registration = runner.registrations[0];
+  expect(registration?.parentSessionId).toBe("parent");
+  expect(registration?.isExpectedStop?.(new WorkflowRunError("Workflow stopped", "run", "/tmp/run", undefined, [], undefined, "aborted"))).toBe(true);
+  expect(registration?.isExpectedStop?.(new WorkflowRunError("failed", "run", "/tmp/run"))).toBe(false);
+  expect(registration?.isExpectedStop?.(new Error("failed"))).toBe(false);
 });
 
 test("session shutdown preempts a workflow stuck after an await", async () => {

@@ -21,6 +21,8 @@ interface AgentHeader {
   tokens: number;
 }
 
+type ComposerKind = "steer" | "message";
+
 interface AgentViewDeps {
   tui: TUI;
   header: () => AgentHeader;
@@ -28,6 +30,10 @@ interface AgentViewDeps {
   /** True while the child is live and steerable/stoppable this session. */
   live: () => boolean;
   onSteer?: (text: string) => void;
+  canMessage?: () => boolean;
+  /** Return true only after the new follow-up run was spawned successfully. */
+  onMessage?: (text: string) => boolean;
+  onSteerUnavailable?: () => void;
   onStop?: () => void;
   /** Subscribe to live session events; returns unsubscribe. Absent for static views. */
   subscribe?: (listener: () => void) => () => void;
@@ -37,7 +43,7 @@ export class AgentView {
   private scrollOffset = 0;
   private autoScroll = true;
   private stopArmed = false;
-  private composer: Input | undefined;
+  private composer: { input: Input; kind: ComposerKind } | undefined;
   private unsubscribe: (() => void) | undefined;
   private lastWidth = 0;
   private lastViewport = 0;
@@ -64,7 +70,11 @@ export class AgentView {
     return !!this.deps.onSteer && this.deps.live() && this.isActive();
   }
 
-  /** Whether the steering composer currently owns keyboard input (including tab). */
+  get canMessage(): boolean {
+    return !!this.deps.onMessage && !this.deps.live() && !!this.deps.canMessage?.();
+  }
+
+  /** Whether a composer currently owns keyboard input, including tab. */
   get composerOpen(): boolean {
     return this.composer !== undefined;
   }
@@ -92,14 +102,17 @@ export class AgentView {
    */
   handleInput(data: string, keyId: string | undefined): boolean {
     if (this.composer) {
-      this.composer.handleInput(data);
+      this.composer.input.handleInput(data);
       this.deps.tui.requestRender();
       return true;
     }
-    if ((keyId === "enter" || keyId === "return") && this.canSteer) {
-      this.stopArmed = false;
-      this.openComposer();
-      return true;
+    if (keyId === "enter" || keyId === "return") {
+      const kind = this.canSteer ? "steer" : this.canMessage ? "message" : undefined;
+      if (kind) {
+        this.stopArmed = false;
+        this.openComposer(kind);
+        return true;
+      }
     }
     if (keyId === "x") {
       if (this.isStoppable()) {
@@ -161,20 +174,30 @@ export class AgentView {
     }
   }
 
-  private openComposer(): void {
+  private openComposer(kind: ComposerKind): void {
     const input = new Input();
     input.focused = true;
     input.onSubmit = (value: string) => {
       const message = value.trim();
-      this.composer = undefined;
-      if (message) this.deps.onSteer?.(message);
+      const submitKind = this.canSteer ? "steer" : this.canMessage ? "message" : undefined;
+      if (submitKind === "steer") {
+        this.composer = undefined;
+        if (message) this.deps.onSteer?.(message);
+      } else if (submitKind === "message" || kind === "message") {
+        // Display eligibility may have lapsed since the composer opened; the
+        // send path revalidates authoritatively and surfaces its own error,
+        // so a lapsed composer never dead-ends silently.
+        if (this.deps.onMessage?.(message)) this.composer = undefined;
+      } else {
+        this.deps.onSteerUnavailable?.();
+      }
       this.deps.tui.requestRender();
     };
     input.onEscape = () => {
       this.composer = undefined;
       this.deps.tui.requestRender();
     };
-    this.composer = input;
+    this.composer = { input, kind };
     this.deps.tui.requestRender();
   }
 
@@ -214,7 +237,9 @@ export class AgentView {
     for (let i = 0; i < viewport; i += 1) lines.push(content[start + i] ?? "");
 
     if (this.composer) {
-      lines.push(truncateToWidth(theme.fg("accent", "✎ ") + (this.composer.render(cap - 2)[0] ?? ""), cap));
+      const kind = this.canSteer ? "steer" : this.canMessage ? "message" : this.composer.kind;
+      const label = `✎ ${kind}: `;
+      lines.push(truncateToWidth(theme.fg("accent", label) + (this.composer.input.render(Math.max(1, cap - label.length))[0] ?? ""), cap));
     }
     return lines;
   }

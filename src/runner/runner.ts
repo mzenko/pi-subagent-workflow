@@ -31,11 +31,13 @@ const globalScope = globalThis as unknown as Record<string, Semaphore | undefine
 const globalSemaphore: Semaphore = globalScope[SEMAPHORE_KEY] ??= new Semaphore(Math.max(1, Math.min(16, cpus().length - 2)));
 
 type ChildBuilder = typeof spawnSubprocessChild;
-type StoreBuilder = (runId: string, parent: ParentContext) => RunStore;
+type StoreBuilder = (runId: string, parent: ParentContext, storeOptions?: { directDelivery?: boolean }) => RunStore;
 type Delay = (ms: number) => Promise<void>;
 interface SpawnRunOptions {
   runId?: string;
   store?: RunStore;
+  /** Results go directly to a human; persisted in run.json before any child starts. */
+  directDelivery?: boolean;
 }
 
 const SETTLE_GRACE_MS = 15_000;
@@ -82,6 +84,7 @@ class Handle implements SubagentHandle {
   private sessionDisposal?: Promise<void>;
   private constructionAbort?: Promise<void>;
   private aborting?: Promise<void>;
+  private externalCancellationRequested = false;
   private startupDetached = false;
   /** Set while the initial run is executing runPrompt. */
   inFlightPrompt?: Promise<SubagentResult>;
@@ -137,7 +140,10 @@ class Handle implements SubagentHandle {
   /** Whether the handle is doing live work right now. */
   get isLive(): boolean { return this.status === "pending" || this.status === "running"; }
   get isDisposingSession(): boolean { return this.sessionDisposal !== undefined; }
+  get wasExternallyCancelled(): boolean { return this.externalCancellationRequested; }
+  markExternalCancellation(): void { this.externalCancellationRequested = true; }
   abort(): Promise<void> {
+    this.markExternalCancellation();
     if (this.aborting) return this.aborting;
     const aborting = this.abortOnce();
     this.aborting = aborting;
@@ -262,7 +268,12 @@ export class SubagentRunner {
     retainAfterDelivery: boolean;
     ownsRun: () => boolean;
   }>();
-  private runControllers = new Map<string, { controller: AbortController; parentSessionId: string; execution: Promise<unknown> }>();
+  private runControllers = new Map<string, {
+    controller: AbortController;
+    parentSessionId: string;
+    execution: Promise<unknown>;
+    isExpectedStop: (error: unknown) => boolean;
+  }>();
   private waitedRuns = new Map<string, { parentSessionId: string; detach: () => boolean }>();
   private childCounter = 0;
   private finalizedRuns = new Set<string>();
@@ -280,8 +291,8 @@ export class SubagentRunner {
   constructor(
     private buildChild: ChildBuilder = spawnSubprocessChild,
     private semaphore: Semaphore = globalSemaphore,
-    private buildStore: StoreBuilder = (runId, parent) =>
-      new RunStore(runId, parent.ctx.cwd, parent.ctx.sessionManager.getSessionId(), parent.ctx.sessionManager.getSessionFile()),
+    private buildStore: StoreBuilder = (runId, parent, storeOptions) =>
+      new RunStore(runId, parent.ctx.cwd, parent.ctx.sessionManager.getSessionId(), parent.ctx.sessionManager.getSessionFile(), storeOptions),
     private delay: Delay = defaultDelay,
   ) {}
 
@@ -363,7 +374,8 @@ export class SubagentRunner {
   spawnRun(specs: ChildSpawnSpec[], parent: ParentContext, options: SpawnRunOptions = {}): SubagentHandle[] {
     const runId = options.runId ?? `run-${Date.now().toString(36)}-${randomUUID().replaceAll("-", "").slice(0, 16)}`;
     const existingStore = this.stores.get(runId);
-    const store = options.store ?? existingStore ?? this.buildStore(runId, parent);
+    const store = options.store ?? existingStore
+      ?? this.buildStore(runId, parent, options.directDelivery ? { directDelivery: true } : undefined);
     const ownsUnregisteredStore = options.store === undefined && existingStore === undefined;
     const identity = store.deliveryIdentity;
     if (!identity || identity.generation < 1) {
@@ -488,8 +500,9 @@ export class SubagentRunner {
     return { id: handle.id, generation: handle.generation, status: "aborted", ...sessionFileFrom(handle.session), text: "", usage: usageFrom(handle.session), resolved: this.fallbackResolved(handle) };
   }
   /** A workflow run registers a controller so a run-level stop cancels its loop, not just its current children. */
-  registerRunController(runId: string, controller: AbortController, parentSessionId: string, execution: Promise<unknown>): void {
-    this.runControllers.set(runId, { controller, parentSessionId, execution });
+  registerRunController(runId: string, controller: AbortController, parentSessionId: string, execution: Promise<unknown>,
+    isExpectedStop: (error: unknown) => boolean = () => false): void {
+    this.runControllers.set(runId, { controller, parentSessionId, execution, isExpectedStop });
   }
   unregisterRunController(runId: string): void { this.runControllers.delete(runId); }
   /**
@@ -547,18 +560,24 @@ export class SubagentRunner {
     // new child after the handle snapshot below and keep the run owned after
     // the parent session that owns it has shut down.
     const executions: Promise<unknown>[] = [];
-    for (const { controller, parentSessionId: owner, execution } of this.runControllers.values()) {
+    for (const { controller, parentSessionId: owner, execution, isExpectedStop } of this.runControllers.values()) {
       if (owner !== parentSessionId) continue;
       controller.abort();
-      executions.push(execution.catch(() => undefined));
+      executions.push(execution.catch((error: unknown) => {
+        if (isExpectedStop(error)) return;
+        throw error;
+      }));
     }
-    await Promise.all([
+    const tasks = [
       ...executions,
       ...[...this.handles.values()].filter((handle) => handle.parent.ctx.sessionManager.getSessionId() === parentSessionId).map(async (handle) => {
         await handle.dispose();
         await this.retire(handle);
       }),
-    ]);
+    ];
+    const results = await Promise.allSettled(tasks);
+    const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failure) throw failure.reason;
   }
 
   private notifySpawn(run: SpawnedRun): void {
@@ -695,9 +714,10 @@ export class SubagentRunner {
       await session.prompt(prompt);
       let message = this.extractLatestAssistant(session);
       // A schema child self-terminates through report_result -> session.abort(),
-      // so a captured result is a success even though the final assistant
-      // message reads aborted. The capture check must stay ahead of the
-      // stop-reason checks or every successful schema child reports aborted.
+      // so a captured result may override an aborted assistant only when that
+      // capture was the sole cancellation source. User abort, parent shutdown,
+      // and timeout provenance stays authoritative even if capture publishes late.
+      if (handle.wasExternallyCancelled) return this.resultFor(handle, "aborted", message);
       if (capture?.called) return { ...this.resultFor(handle, "completed", message), structured: capture.value };
       // Never turn an aborted or failed model run into a fresh repair run. In
       // particular, a timeout has already fired and cannot bound a second
@@ -707,30 +727,30 @@ export class SubagentRunner {
       if (capture) {
         await session.prompt(STRUCTURED_REPAIR_PROMPT);
         message = this.extractLatestAssistant(session);
+        if (handle.wasExternallyCancelled) return this.resultFor(handle, "aborted", message);
         if (capture.called) return { ...this.resultFor(handle, "completed", message), structured: capture.value };
         if (message?.stopReason === "aborted") return this.resultFor(handle, "aborted", message);
         if (message?.stopReason === "error") return this.failure(handle, message.errorMessage ?? "Child model request failed", message);
         return this.failure(handle, "Child did not call report_result after one repair attempt", message);
       }
       return this.resultFor(handle, "completed", message);
-    } catch (error) { return this.failure(handle, error); }
-    finally { clearTimeout(); }
+    } catch (error) {
+      if (handle.wasExternallyCancelled) {
+        const message = this.extractLatestAssistant(session);
+        return this.resultFor(handle, "aborted", message);
+      }
+      return this.failure(handle, error);
+    } finally { clearTimeout(); }
   }
 
   private subscribe(handle: Handle): void {
     const session = handle.session;
     const unsubscribe = session?.subscribe((event) => {
-      if (event.type === "tool_execution_start" && typeof event.toolName === "string") {
+      if (event.type === "tool_execution_start") {
         const activityEvent = { type: "activity" as const, id: handle.id, description: summarizeCall(event.toolName, event.args) };
         handle.emit(activityEvent);
       }
-      if (
-        event.type === "turn_end"
-        && typeof event.message === "object"
-        && event.message !== null
-        && "role" in event.message
-        && event.message.role === "assistant"
-      ) {
+      if (event.type === "turn_end" && event.message.role === "assistant") {
         handle.emit({ type: "usage", id: handle.id, usage: { ...session.usage } });
       }
     });
@@ -756,6 +776,7 @@ export class SubagentRunner {
     if (agentTimeoutMinutes === 0) return () => {};
     let cancelled = false;
     const timer = setTimeout(() => {
+      handle.markExternalCancellation();
       void session.abort().catch((error: unknown) => {
         reportDiagnostic(`[subagent-workflow] timed-out child abort failed: ${errorMessage(error)}`);
       });

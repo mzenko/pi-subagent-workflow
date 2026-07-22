@@ -1,7 +1,7 @@
 /** Slash commands and native TUI editor for user-global workflow settings. */
 
 import { getSelectListTheme, getSettingsListTheme, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { Container, type SelectItem, SelectList, type SettingItem, SettingsList } from "@earendil-works/pi-tui";
+import { Container, type SelectItem, SelectList, type SettingItem, SettingsList, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { sanitizeTerminalText } from "../ui/sanitize.js";
 import { errorMessage } from "../util.js";
 import {
@@ -159,12 +159,21 @@ function chooseSetting(ctx: ExtensionCommandContext, store: WorkflowSettingsStor
     const container = new Container();
     const warning = store.getWarning();
     container.addChild({
-      render: () => [
-        theme.fg("accent", theme.bold("Subagent workflow settings")),
-        theme.fg("dim", sanitizeTerminalText(store.path)),
-        ...(warning ? [theme.fg("warning", sanitizeTerminalText(warning))] : []),
-        "",
-      ],
+      render: (width: number) => {
+        const cap = Math.max(1, width);
+        // The warning (e.g. a schema-version reset notice) wraps rather than
+        // truncates: its version numbers and "file left unchanged" detail are
+        // operationally important.
+        const warningLines = warning
+          ? wrapTextWithAnsi(sanitizeTerminalText(warning), cap).map((line) => theme.fg("warning", line))
+          : [];
+        return [
+          truncateToWidth(theme.fg("accent", theme.bold("Subagent workflow settings")), cap),
+          truncateToWidth(theme.fg("dim", sanitizeTerminalText(store.path)), cap),
+          ...warningLines,
+          "",
+        ];
+      },
       invalidate: () => {},
     });
     const list = new SettingsList(
@@ -179,7 +188,9 @@ function chooseSetting(ctx: ExtensionCommandContext, store: WorkflowSettingsStor
     );
     container.addChild(list);
     return {
-      render: (width) => container.render(width),
+      // The final cap makes the whole composed dialog immune to any child
+      // line escaping width discipline; pi-tui kills the process otherwise.
+      render: (width) => container.render(width).map((line) => truncateToWidth(line, Math.max(1, width))),
       invalidate: () => container.invalidate(),
       handleInput: (data) => {
         list.handleInput(data);

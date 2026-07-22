@@ -5,7 +5,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, constants, mkdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { childLabel } from "../../util.js";
@@ -56,6 +56,51 @@ export function resolveShimPath(selfPath: string): string {
 
 type SpawnRpc = (command: readonly string[], options: { cwd: string; env?: NodeJS.ProcessEnv }) => ChildRpc;
 
+export interface LaunchArtifactOverrides {
+  childPiEntry?: string;
+  shimPath?: string;
+  forkSessionFile?: string;
+}
+
+function validateLaunchArtifact(path: string, label: string): void {
+  let isFile: boolean;
+  try {
+    isFile = statSync(path).isFile();
+    accessSync(path, constants.R_OK);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`${label} ${JSON.stringify(path)} is not a readable regular file: ${detail}`, { cause: error });
+  }
+  if (!isFile) throw new Error(`${label} ${JSON.stringify(path)} is not a readable regular file: path is not a regular file`);
+}
+
+/** Side-effect-free checks that must pass before any launch artifact is written. */
+export function preflightSubprocessChild(spec: SubagentSpec, parent: ParentContext, overrides: LaunchArtifactOverrides = {}) {
+  const cwd = spec.cwd ?? parent.ctx.cwd;
+  let isDirectory: boolean;
+  try {
+    isDirectory = statSync(cwd).isDirectory();
+    accessSync(cwd, constants.X_OK);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Child cwd ${JSON.stringify(cwd)} is not usable as a spawn cwd: ${detail}`, { cause: error });
+  }
+  if (!isDirectory) throw new Error(`Child cwd ${JSON.stringify(cwd)} is not usable as a spawn cwd: path is not a directory`);
+
+  const { model, thinking } = resolveModel(spec, parent.ctx, parent.thinkingLevel);
+  const tools = spec.schema && spec.tools ? [...new Set([...spec.tools, "report_result"])] : spec.tools;
+  const excludeTools = spec.schema ? spec.excludeTools?.filter((name) => name !== "report_result") : spec.excludeTools;
+  for (const name of [...(tools ?? []), ...(excludeTools ?? [])]) {
+    if (name.includes(",")) throw new Error(`Tool name ${JSON.stringify(name)} contains a comma and cannot cross the pi CLI boundary`);
+  }
+  const shimPath = overrides.shimPath ?? resolveShimPath(parent.selfPath);
+  const childPiEntry = overrides.childPiEntry ?? resolveChildPiEntry();
+  validateLaunchArtifact(childPiEntry, "Child pi CLI entry");
+  validateLaunchArtifact(shimPath, "Child shim");
+  if (overrides.forkSessionFile !== undefined) validateLaunchArtifact(overrides.forkSessionFile, "Fork session file");
+  return { cwd, model, thinking, tools, excludeTools, shimPath, childPiEntry };
+}
+
 /** The child construction backend; the runner's ChildBuilder seam. */
 export async function spawnSubprocessChild(
   spec: SubagentSpec,
@@ -63,14 +108,13 @@ export async function spawnSubprocessChild(
   persistence: { sessionsDir: string; forkSessionFile?: string },
   spawnRpc: SpawnRpc = spawnChildRpc,
 ): Promise<ConstructedChild> {
-  const cwd = spec.cwd ?? parent.ctx.cwd;
-  const { model, thinking } = resolveModel(spec, parent.ctx, parent.thinkingLevel);
+  // Everything that can fail synchronously (cwd, model, arg validation, entry
+  // resolution) runs before any file is written. buildChildArgs rechecks its
+  // own pure boundary rules as construction-time defense in depth.
+  const { cwd, model, thinking, tools, excludeTools, shimPath, childPiEntry } = preflightSubprocessChild(spec, parent, {
+    forkSessionFile: persistence.forkSessionFile,
+  });
   const capture: SchemaCapture | undefined = spec.schema ? { called: false } : undefined;
-  const tools = spec.tools && capture ? [...new Set([...spec.tools, "report_result"])] : spec.tools;
-  const excludeTools = capture ? spec.excludeTools?.filter((name) => name !== "report_result") : spec.excludeTools;
-
-  // Everything that can fail synchronously (arg validation, entry resolution)
-  // runs before any file is written, so a refused spawn leaves nothing behind.
   const args = buildChildArgs({
     provider: model.provider,
     modelId: model.id,
@@ -80,9 +124,8 @@ export async function spawnSubprocessChild(
     sessionDir: persistence.sessionsDir,
     forkSessionFile: persistence.forkSessionFile,
     appendSystemPrompt: SUBAGENT_FRAMING,
-    shimPath: resolveShimPath(parent.selfPath),
+    shimPath,
   });
-  const childPiEntry = resolveChildPiEntry();
 
   const shimDir = join(dirname(persistence.sessionsDir), "shim");
   mkdirSync(shimDir, { recursive: true, mode: 0o700 });
@@ -136,7 +179,7 @@ export async function spawnSubprocessChild(
       );
     }
     const session = await RpcChildSession.start(rpc);
-    if (capture) wireSchemaCapture(rpc, session, capture);
+    if (capture) wireSchemaCapture(session, capture);
     return {
       session,
       resolved: {
@@ -164,19 +207,81 @@ export async function spawnSubprocessChild(
  * through tool events, captures the validated arguments, and ends the turn,
  * mirroring the in-process capture-and-terminate contract.
  */
-function wireSchemaCapture(rpc: ChildRpc, session: RpcChildSession, capture: SchemaCapture): void {
+function wireSchemaCapture(session: RpcChildSession, capture: SchemaCapture): void {
   capture.terminate = () => {
     void session.abort().catch(() => undefined);
   };
-  const argsByCall = new Map<string, unknown>();
-  rpc.onEvent((event) => {
-    if (event.toolName !== "report_result" || typeof event.toolCallId !== "string") return;
-    if (event.type === "tool_execution_start") argsByCall.set(event.toolCallId, event.args);
-    if (event.type === "tool_execution_end" && event.isError !== true && !capture.called) {
-      capture.called = true;
-      capture.value = argsByCall.get(event.toolCallId);
-      capture.terminate?.();
+  type CallState =
+    | { state: "active"; toolName: string; args: unknown }
+    | { state: "terminal"; toolName: string };
+  interface Candidate { id: string; value: unknown }
+  const calls = new Map<string, CallState>();
+  let candidate: Candidate | undefined;
+  let published = false;
+  let attemptPoisoned = false;
+  let activeAttempt: number | undefined;
+  const clearAttempt = (): void => {
+    calls.clear();
+    candidate = undefined;
+  };
+  const poisonAttempt = (): void => {
+    attemptPoisoned = true;
+  };
+
+  session.onPromptAttempt((attemptEvent) => {
+    if (published) return;
+    if (attemptEvent.type === "started") {
+      activeAttempt = attemptEvent.attempt;
+      clearAttempt();
+      attemptPoisoned = false;
+      return;
     }
+    if (attemptEvent.attempt !== activeAttempt) return;
+    if (attemptEvent.type === "discarded") {
+      clearAttempt();
+      attemptPoisoned = false;
+      activeAttempt = undefined;
+      return;
+    }
+    if (attemptEvent.type === "settled") {
+      const state = candidate && calls.get(candidate.id);
+      const hasActiveCall = [...calls.values()].some((call) => call.state === "active");
+      if (
+        !attemptPoisoned
+        && !hasActiveCall
+        && candidate
+        && state?.state === "terminal"
+        && state.toolName === "report_result"
+      ) {
+        capture.called = true;
+        capture.value = candidate.value;
+        published = true;
+      }
+      clearAttempt();
+      attemptPoisoned = false;
+      activeAttempt = undefined;
+      return;
+    }
+    const event = attemptEvent.event;
+    if (event.type !== "tool_execution_start" && event.type !== "tool_execution_end") return;
+    const existing = calls.get(event.toolCallId);
+    if (event.type === "tool_execution_start") {
+      if (existing || (event.toolName === "report_result" && candidate)) poisonAttempt();
+      if (!existing) calls.set(event.toolCallId, { state: "active", toolName: event.toolName, args: event.args });
+      return;
+    }
+    if (!existing || existing.state !== "active" || existing.toolName !== event.toolName) {
+      poisonAttempt();
+      return;
+    }
+    calls.set(event.toolCallId, { state: "terminal", toolName: event.toolName });
+    if (event.toolName !== "report_result" || event.isError) return;
+    if (candidate) {
+      poisonAttempt();
+      return;
+    }
+    candidate = { id: event.toolCallId, value: existing.args };
+    capture.terminate?.();
   });
 }
 

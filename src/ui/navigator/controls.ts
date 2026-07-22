@@ -47,13 +47,18 @@ export function passesFilter(status: SubagentStatus, filter: FilterMode): boolea
  */
 export function orderedChildren(detail: RunDetail, filter: FilterMode): ChildRow[] {
   const filtered = detail.children.filter((child) => passesFilter(child.status, filter));
-  if (detail.kind !== "workflow") return filtered;
+  // Alphabetical by label (id tiebreak) so the list is stable while a run
+  // executes: start-time ordering floated queued children (no startedAt)
+  // above running ones and reshuffled rows as workers launched.
+  const alphabetical = (a: ChildRow, b: ChildRow): number =>
+    a.label.localeCompare(b.label) || a.id.localeCompare(b.id);
+  if (detail.kind !== "workflow") return [...filtered].sort(alphabetical);
   const order = detail.phases.map((phase) => phase.title);
   const rank = (child: ChildRow): number => {
     const index = child.phase ? order.indexOf(child.phase) : -1;
     return index < 0 ? order.length : index;
   };
-  return [...filtered].sort((a, b) => rank(a) - rank(b) || (a.startedAt ?? 0) - (b.startedAt ?? 0));
+  return [...filtered].sort((a, b) => rank(a) - rank(b) || alphabetical(a, b));
 }
 
 export interface RunActionAvailability {
@@ -145,6 +150,8 @@ interface FooterState {
   canSave?: boolean;
   /** Agent-detail only: whether the steering composer is available. */
   canSteer?: boolean;
+  /** Agent-detail only: whether a persisted child can start a follow-up thread. */
+  canMessage?: boolean;
   /** Whether a same-view, second-press stop confirmation is armed. */
   stopArmed?: boolean;
 }
@@ -168,6 +175,7 @@ export function footerHint(state: FooterState, theme: ThemeLike): string {
     parts.length = 0;
     parts.push("↑↓ scroll", "shift+↑↓ page");
     if (state.canSteer) parts.push("enter steer");
+    else if (state.canMessage) parts.push("enter message");
     if (state.canCycle) parts.push("tab next live");
     if (state.canStop) parts.push(state.stopArmed ? "x again to STOP" : "x stop");
     parts.push("esc back");

@@ -4,9 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { acknowledgeDeliveryMessage, releasePendingDeliveries } from "../src/store/delivery-marker.js";
+import { RunStore } from "../src/store/run-store.js";
 import { formatDelivery } from "../src/tool/subagent-tool.js";
 import { buildDeliveryEnvelope, DELIVERY_ENVELOPE_BUDGET, ENVELOPE_LINE_MAX } from "../src/ui/delivery-envelope.js";
-import { safeDeliveryValue } from "../src/ui/delivery-safe.js";
+import { chunkDeliveryText, formatFailureText, safeDeliveryValue } from "../src/ui/delivery-safe.js";
 import { deliverWorkflowInBackground, formatWorkflowDelivery, formatWorkflowFailure } from "../src/workflow/launch.js";
 import { WorkflowRunError, type WorkflowRunResult } from "../src/workflow/workflow-runner.js";
 
@@ -25,6 +26,85 @@ async function captureBackgroundWorkflowDelivery(execution: Promise<WorkflowRunR
   deliverWorkflowInBackground(pi, execution, "parent");
   return { ...await delivery, entries };
 }
+
+test("formatFailureText preserves ordinary multiline text and strips multiline terminal strings", () => {
+  const ordinary = "first line\nsecond line\nthird line";
+  expect(formatFailureText(ordinary)).toBe(ordinary);
+
+  const ESC = String.fromCharCode(0x1b);
+  const BEL = String.fromCharCode(0x07);
+  const cases = [
+    `${ESC}]0;evil\npayload${BEL}after`,
+    `${ESC}Pevil\npayload${ESC}\\after`,
+  ];
+  for (const value of cases) {
+    const formatted = formatFailureText(value);
+    expect(formatted).toBe("after");
+    expect(formatted).not.toContain("evil");
+    expect(formatted).not.toContain("payload");
+  }
+});
+
+test("formatFailureText directly covers length and repeated-line boundaries", () => {
+  const limit = 40;
+  const cases = [
+    { value: "", expected: "" },
+    { value: "x".repeat(limit - 1), expected: "x".repeat(limit - 1) },
+    { value: "x".repeat(limit), expected: "x".repeat(limit) },
+    { value: "x".repeat(limit + 1) },
+    { value: "head\n\n\n\ntail", expected: "head\n(repeated 3 times)\ntail" },
+  ];
+
+  for (const { value, expected } of cases) {
+    const formatted = formatFailureText(value, limit);
+    expect(formatted.length).toBeLessThanOrEqual(limit);
+    if (expected !== undefined) expect(formatted).toBe(expected);
+  }
+});
+
+test("formatFailureText handles omission-note budget boundaries", () => {
+  const note = "[earlier output truncated]";
+  const value = "x".repeat(100);
+  const cases = [
+    { limit: note.length, expected: note },
+    { limit: note.length + 1, expected: note },
+    { limit: note.length + 2, expected: `x\n${note}` },
+  ];
+
+  for (const { limit, expected } of cases) {
+    const formatted = formatFailureText(value, limit);
+    expect(formatted).toBe(expected);
+    expect(formatted.length).toBeLessThanOrEqual(limit);
+  }
+});
+
+test("chunkDeliveryText directly covers boundaries without splitting surrogate pairs", () => {
+  const cases = [
+    { value: "", maxLineLength: 4 },
+    { value: "abc", maxLineLength: 4 },
+    { value: "abcd", maxLineLength: 4 },
+    { value: "abcde", maxLineLength: 4 },
+    { value: "abc😀def", maxLineLength: 4 },
+  ];
+
+  for (const { value, maxLineLength } of cases) {
+    const chunks = chunkDeliveryText(value, maxLineLength).split("\n");
+    expect(chunks.join("")).toBe(value);
+    for (const chunk of chunks) {
+      expect(chunk.length).toBeLessThanOrEqual(maxLineLength);
+      for (let index = 0; index < chunk.length; index += 1) {
+        const code = chunk.charCodeAt(index);
+        if (code >= 0xd800 && code <= 0xdbff) {
+          const next = chunk.charCodeAt(index + 1);
+          expect(next >= 0xdc00 && next <= 0xdfff).toBe(true);
+          index += 1;
+        } else {
+          expect(code < 0xdc00 || code > 0xdfff).toBe(true);
+        }
+      }
+    }
+  }
+});
 
 test("subagent failure delivery includes identity, error, and respawn recovery", () => {
   const text = formatDelivery("run-1", "/runs/run-1", [{
@@ -71,6 +151,49 @@ test("completed workflow delivery groups failed children with one resume recover
   const text = formatWorkflowDelivery({ runId: "workflow-2", runDir: "/runs/workflow-2", meta: { name: "test", description: "test" }, result: null, failedChildren: [failedChild] });
   expect(text).toContain("1 failed child (Inspect API): timeout");
   expect(text).toContain('workflow({ scriptPath: "/runs/workflow-2/script.js", resumeRunId: "workflow-2" })');
+});
+
+test("workflow failures collapse consecutive duplicate lines exactly", () => {
+  const repeated = Array.from({ length: 7 }, () => "PDF parser warning").join("\n");
+  const error = new WorkflowRunError("child failed", "workflow-repeat", "/runs/workflow-repeat", undefined, [{
+    id: "child-repeat",
+    status: "failed",
+    text: "",
+    error: `${repeated}\nfatal parser error`,
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+    resolved: { provider: "test", modelId: "test", thinkingLevel: "off", tools: [], cwd: "/work", label: "Parse PDF" },
+  }], 1);
+  const text = formatWorkflowFailure(error);
+
+  expect(text).toContain("PDF parser warning (repeated 7 times)");
+  expect(text.match(/PDF parser warning/g)).toHaveLength(1);
+  expect(text).toContain("fatal parser error");
+});
+
+test("workflow failures collapse repeated lines and preserve the terminal causal tail", () => {
+  const noisyError = [
+    ...Array.from({ length: 40 }, () => "PDF parser warning: malformed xref"),
+    ...Array.from({ length: 100 }, (_, index) => `distinct parser diagnostic ${index}: ${"noise".repeat(8)}`),
+    "RPC frame cap exceeded while returning the fatal result",
+  ].join("\n");
+  const failedChild = {
+    id: "child-noisy",
+    status: "failed" as const,
+    text: "",
+    error: noisyError,
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+    resolved: { provider: "test", modelId: "test", thinkingLevel: "off" as const, tools: [], cwd: "/work", label: "Parse PDF" },
+  };
+  const text = formatWorkflowFailure(new WorkflowRunError(
+    "child failed", "workflow-noisy", "/runs/workflow-noisy", undefined, [failedChild], 1,
+  ));
+
+  expect(text).toContain("1 failed child (Parse PDF):");
+  expect(text).toContain("RPC frame cap exceeded while returning the fatal result");
+  expect(text).toContain("earlier output truncated");
+  expect(text).toContain("including 39 repeats");
+  expect(text).not.toContain("distinct parser diagnostic 0:");
+  expect(text.split("\n").every((line) => line.length <= ENVELOPE_LINE_MAX)).toBe(true);
 });
 
 test("background workflow success delivery writes its marker and neutralizes controls", async () => {
@@ -153,7 +276,7 @@ test("background workflow failure delivery writes its marker and strips controls
   expect(options).toEqual({ deliverAs: "steer" });
   expect(entries).toEqual([]);
   const safeRunDir = safeDeliveryValue(unsafeRunDir);
-  expect(message).toContain(`Workflow run workflow-9\nRun directory: ${safeRunDir}\nStatus: failed\nError: boomredforged`);
+  expect(message).toContain(`Workflow run workflow-9\nRun directory: ${safeRunDir}\nStatus: failed\nError: boomred\nforged`);
   expect(message).toContain("1 failed child (Audit API): failred");
   expect(message).toContain(`workflow({ scriptPath: ${JSON.stringify(`${safeRunDir}/script.js`)}, resumeRunId: "workflow-9" })`);
   expect(message).toContain("Warning: diskslow");
@@ -401,6 +524,46 @@ test("fixed overflow preserves recovery and artifacts before cutting failures", 
   expect(text).toContain(artifact);
   expect(text).toContain("[fixed sections truncated]");
   expect(text).not.toContain(failures.at(-1)!);
+});
+
+test("workflow overflow preserves the activity log when activity lines are dropped", () => {
+  const rootDir = mkdtempSync(join(tmpdir(), "workflow-activity-overflow-"));
+  const store = new RunStore("workflow-activity-overflow", "/work/example", "parent", undefined, { rootDir, kind: "workflow" });
+  try {
+    for (let index = 0; index < 65; index += 1) {
+      store.addChild(`activity-child-${index}`, {
+        prompt: `task ${index}`,
+        label: `${"long-activity-label-".repeat(4)}${index}`,
+      });
+      store.recordEvent({ type: "activity", id: `activity-child-${index}`, description: `tool_${index} {}` });
+    }
+    const failed = Array.from({ length: 12 }, (_, index) => ({
+      id: `failed-${index}`,
+      status: "failed" as const,
+      text: "",
+      error: `failure-${index}:${"f".repeat(1_900)}`,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+      resolved: { provider: "test", modelId: "test", thinkingLevel: "off" as const, tools: [], cwd: "/work", label: `Failure ${index}` },
+    }));
+
+    const text = formatWorkflowFailure(new WorkflowRunError(
+      "workflow failed",
+      "workflow-activity-overflow",
+      store.runDir,
+      undefined,
+      failed,
+      1,
+    ));
+    const eventsPath = `${store.runDir}/events.jsonl`;
+
+    expect(text.length).toBeLessThanOrEqual(DELIVERY_ENVELOPE_BUDGET);
+    expect(text).toContain(`Activity log: ${eventsPath}`);
+    expect(text).toContain("[fixed sections truncated]");
+    expect(text).not.toContain("tool_63 x1");
+  } finally {
+    store.releaseOwnership();
+    rmSync(rootDir, { recursive: true, force: true });
+  }
 });
 
 test("delivery preview truncation never leaves an unpaired high surrogate", () => {

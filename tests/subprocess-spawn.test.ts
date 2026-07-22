@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, existsSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import childShim from "../extensions/child-shim.js";
 import type { ParentContext } from "../src/runner/child.js";
-import { spawnSubprocessChild, resolveShimPath, resolveChildPiEntry } from "../src/runner/subprocess/spawn-child.js";
+import { preflightSubprocessChild, spawnSubprocessChild, resolveShimPath, resolveChildPiEntry } from "../src/runner/subprocess/spawn-child.js";
 import type { ChildRpc, RpcExit } from "../src/runner/subprocess/rpc-transport.js";
 import { readToolReport, SHIM_SPEC_ENV, writeToolReport } from "../src/runner/subprocess/shim-contract.js";
 import type { SubagentSpec } from "../src/types.js";
@@ -23,6 +23,8 @@ afterEach(() => {
 
 function fakeParent(cwd: string): ParentContext {
   const model = { provider: "openai-codex", id: "gpt-5.6-terra" };
+  const selfPath = join(cwd, "subagent-workflow.ts");
+  writeFileSync(resolveShimPath(selfPath), "// readable child shim fixture\n");
   return {
     ctx: {
       cwd,
@@ -30,7 +32,7 @@ function fakeParent(cwd: string): ParentContext {
       modelRegistry: { find: (provider: string, id: string) => (provider === model.provider && id === model.id ? model : undefined), getAll: () => [model] },
     } as unknown as ExtensionContext,
     thinkingLevel: "high",
-    selfPath: "/pkg/extensions/subagent-workflow.ts",
+    selfPath,
   };
 }
 
@@ -64,6 +66,7 @@ function fakeSpawn(options: { onSpawn?: (env: NodeJS.ProcessEnv | undefined) => 
       controls.sent.push(command);
       const type = command.type as string;
       if (options.respond && type in options.respond) return Promise.resolve(options.respond[type]);
+      if (type === "get_state") return Promise.resolve({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
       return Promise.resolve(undefined);
     },
     send: (message) => { controls.rawSent.push(message); },
@@ -96,19 +99,76 @@ describe("spawnSubprocessChild", () => {
   test("spawns pi rpc with the mapped flags and returns the reported toolset", async () => {
     const runDir = tempDir();
     const sessionsDir = join(runDir, "sessions");
-    const controls = fakeSpawn({ respond: { get_state: { sessionFile: join(sessionsDir, "child.jsonl") } } });
+    const controls = fakeSpawn({ respond: { get_state: { isStreaming: false, isCompacting: false, pendingMessageCount: 0, sessionFile: join(sessionsDir, "child.jsonl") } } });
     const spec: SubagentSpec = { prompt: "audit the code", tools: ["read", "bash"] };
-    const child = await spawnSubprocessChild(spec, fakeParent(runDir), { sessionsDir }, spawnFor(controls));
+    const parent = fakeParent(runDir);
+    const child = await spawnSubprocessChild(spec, parent, { sessionsDir }, spawnFor(controls));
 
     const command = controls.spawnedCommands[0]!;
     expect(command[0]).toBe(process.execPath);
     expect(command[1]).toBe(resolveChildPiEntry());
     expect(command).toContain("--session-dir");
     expect(command).toContain("--extension");
-    expect(command).toContain(resolveShimPath("/pkg/extensions/subagent-workflow.ts"));
+    expect(command).toContain(resolveShimPath(parent.selfPath));
     expect(controls.spawnedEnvs[0]?.[SHIM_SPEC_ENV]).toContain(join(runDir, "shim"));
     expect(child.resolved.tools).toEqual(["read", "bash", "report_result"]);
     expect(child.session.sessionFile).toBe(join(sessionsDir, "child.jsonl"));
+  });
+
+  test("rejects an unusable cwd before writing shim files or spawning", async () => {
+    const runDir = tempDir();
+    const missingCwd = join(runDir, "missing-cwd");
+    const controls = fakeSpawn({});
+
+    await expect(spawnSubprocessChild(
+      { prompt: "task", cwd: missingCwd },
+      fakeParent(runDir),
+      { sessionsDir: join(runDir, "sessions") },
+      spawnFor(controls),
+    )).rejects.toThrow("not usable as a spawn cwd");
+
+    expect(controls.spawnedCommands).toEqual([]);
+    expect(existsSync(join(runDir, "shim"))).toBe(false);
+  });
+
+  test("preflight rejects missing and non-file launch artifacts", () => {
+    const runDir = tempDir();
+    const parent = fakeParent(runDir);
+    const readable = join(runDir, "readable.js");
+    const missing = join(runDir, "missing.js");
+    const directory = join(runDir, "artifact-directory");
+    writeFileSync(readable, "// fixture\n");
+    mkdirSync(directory);
+
+    expect(() => preflightSubprocessChild({ prompt: "task" }, parent, {
+      childPiEntry: missing,
+      shimPath: readable,
+    })).toThrow("Child pi CLI entry");
+    expect(() => preflightSubprocessChild({ prompt: "task" }, parent, {
+      childPiEntry: readable,
+      shimPath: missing,
+    })).toThrow("Child shim");
+    expect(() => preflightSubprocessChild({ prompt: "task" }, parent, {
+      childPiEntry: readable,
+      shimPath: directory,
+    })).toThrow("not a regular file");
+  });
+
+  test("preflight validates fork session artifacts without writing files", () => {
+    const runDir = tempDir();
+    const parent = fakeParent(runDir);
+    const childPiEntry = join(runDir, "cli.js");
+    const forkSessionFile = join(runDir, "source.jsonl");
+    writeFileSync(childPiEntry, "// fixture\n");
+    writeFileSync(forkSessionFile, "transcript\n");
+
+    const result = preflightSubprocessChild({ prompt: "task" }, parent, { childPiEntry, forkSessionFile });
+    expect(result.childPiEntry).toBe(childPiEntry);
+    expect(() => preflightSubprocessChild({ prompt: "task" }, parent, {
+      childPiEntry,
+      forkSessionFile: join(runDir, "missing.jsonl"),
+    })).toThrow("Fork session file");
+    expect(existsSync(join(runDir, "shim"))).toBe(false);
   });
 
   test("fails closed with a kill when explicitly requested tools do not resolve", async () => {
@@ -127,11 +187,18 @@ describe("spawnSubprocessChild", () => {
     const child = await spawnSubprocessChild(spec, fakeParent(runDir), { sessionsDir: join(runDir, "sessions") }, spawnFor(controls));
     expect(child.schemaCapture?.called).toBe(false);
 
+    const prompt = child.session.prompt("report");
+    await Bun.sleep(0);
+    controls.emit({ type: "agent_start" });
     controls.emit({ type: "tool_execution_start", toolCallId: "c1", toolName: "report_result", args: { answer: 42 } });
     controls.emit({ type: "tool_execution_end", toolCallId: "c1", toolName: "report_result", result: "ok", isError: false });
+    expect(child.schemaCapture?.called).toBe(false);
+    expect(controls.sent).toContainEqual({ type: "abort" });
+    controls.emit({ type: "agent_settled" });
+    await prompt;
+
     expect(child.schemaCapture?.called).toBe(true);
     expect(child.schemaCapture?.value).toEqual({ answer: 42 });
-    expect(controls.sent).toContainEqual({ type: "abort" });
   });
 
   test("ignores failed report_result executions", async () => {
@@ -139,9 +206,49 @@ describe("spawnSubprocessChild", () => {
     const controls = fakeSpawn({});
     const spec: SubagentSpec = { prompt: "report", schema: { type: "object" } };
     const child = await spawnSubprocessChild(spec, fakeParent(runDir), { sessionsDir: join(runDir, "sessions") }, spawnFor(controls));
+    const prompt = child.session.prompt("report");
+    await Bun.sleep(0);
+    controls.emit({ type: "agent_start" });
     controls.emit({ type: "tool_execution_start", toolCallId: "c1", toolName: "report_result", args: { bad: true } });
     controls.emit({ type: "tool_execution_end", toolCallId: "c1", toolName: "report_result", result: "invalid", isError: true });
+    controls.emit({ type: "agent_settled" });
+    await prompt;
     expect(child.schemaCapture?.called).toBe(false);
+  });
+
+  test("schema capture poisoning is scoped to one prompt attempt", async () => {
+    const runDir = tempDir();
+    const controls = fakeSpawn({});
+    const child = await spawnSubprocessChild(
+      { prompt: "report", schema: { type: "object" } },
+      fakeParent(runDir),
+      { sessionsDir: join(runDir, "sessions") },
+      spawnFor(controls),
+    );
+
+    const first = child.session.prompt("first attempt");
+    await Bun.sleep(0);
+    controls.emit({ type: "agent_start" });
+    controls.emit({ type: "tool_execution_start", toolCallId: "c1", toolName: "report_result", args: { stale: true } });
+    controls.emit({ type: "tool_execution_end", toolCallId: "c1", toolName: "report_result", result: "ok", isError: false });
+    controls.emit({ type: "tool_execution_end", toolCallId: "c1", toolName: "report_result", result: "duplicate", isError: false });
+    controls.emit({ type: "agent_settled" });
+    await first;
+    expect(child.schemaCapture?.called).toBe(false);
+
+    const second = child.session.prompt("repair attempt");
+    await Bun.sleep(0);
+    controls.emit({ type: "agent_settled" });
+    await Bun.sleep(0);
+    expect(child.schemaCapture?.called).toBe(false);
+    controls.emit({ type: "agent_start" });
+    controls.emit({ type: "tool_execution_start", toolCallId: "c2", toolName: "report_result", args: { answer: 42 } });
+    controls.emit({ type: "tool_execution_end", toolCallId: "c2", toolName: "report_result", result: "ok", isError: false });
+    controls.emit({ type: "agent_settled" });
+    await second;
+
+    expect(child.schemaCapture?.called).toBe(true);
+    expect(child.schemaCapture?.value).toEqual({ answer: 42 });
   });
 
   test("answers blocking extension UI requests with cancellation", async () => {
@@ -229,6 +336,7 @@ describe("spawnSubprocessChild", () => {
   test("threads a follow-up fork without requesting the source schema tool", async () => {
     const runDir = tempDir();
     const sourceSession = join(runDir, "source.jsonl");
+    writeFileSync(sourceSession, "transcript\n");
     const controls = fakeSpawn({});
     await spawnSubprocessChild(
       { prompt: "continue", tools: ["read"] },

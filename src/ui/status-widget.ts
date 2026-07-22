@@ -100,7 +100,9 @@ function summaryParts(runs: WidgetRunView[]): string[] {
 /** Build the widget lines from active run views. Pure and unit tested. */
 export function renderWidgetLines(runs: WidgetRunView[], theme: ThemeLike, width: number, now: number, maxRows = FALLBACK_ROW_CAP): string[] {
   if (runs.length === 0) return [];
-  const cap = Math.max(20, width);
+  // Never exceed the host-supplied width: pi-tui kills the process on any
+  // over-wide line, so there is no minimum layout width worth crashing for.
+  const cap = Math.max(1, width);
   const header = `${theme.fg("accent", spinnerFrame(now))} ${theme.bold("agents")} ${theme.fg("dim", summaryParts(runs).join(" · "))}`;
   const lines: string[] = [truncateToWidth(header, cap)];
 

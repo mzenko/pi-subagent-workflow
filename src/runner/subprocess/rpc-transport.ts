@@ -2,7 +2,7 @@
  * Minimal JSONL transport for a `pi --mode rpc` child process. Owns the
  * process: spawn, request/response correlation, event fan-out, and honest
  * exit semantics - every pending and future request rejects once the channel
- * is done, so a dead child can never leave a caller waiting.
+ * terminally fails or exits, so a dead child can never leave a caller waiting.
  */
 
 import { spawn } from "node:child_process";
@@ -18,6 +18,40 @@ export interface RpcExit {
 export interface RpcRequestOptions {
   /** Reject the request after this many ms if the child has not answered. */
   timeoutMs?: number;
+  /** Runs synchronously when the successful response frame is dispatched. */
+  onResponse?: (response: unknown) => void;
+}
+
+/** An explicit negative response rejects the correlated command. */
+export class RpcCommandRejectedError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "RpcCommandRejectedError";
+  }
+}
+
+/** A correlated response whose command or success discriminator is untrustworthy. */
+export class RpcProtocolError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "RpcProtocolError";
+  }
+}
+
+/** A request failed because the owned RPC channel closed. */
+export class RpcChannelClosedError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "RpcChannelClosedError";
+  }
+}
+
+/** The child emitted one protocol frame larger than the transport can accept. */
+export class RpcFrameTooLargeError extends RpcChannelClosedError {
+  constructor(message: string) {
+    super(message);
+    this.name = "RpcFrameTooLargeError";
+  }
 }
 
 /** The transport surface the session adapter consumes; faked in tests. */
@@ -35,14 +69,17 @@ export interface ChildRpc {
 }
 
 const STDERR_TAIL_MAX = 4_096;
-/** Largest JSONL frame buffered and parsed, in UTF-16 code units of decoded text. */
-const MAX_LINE_CHARS = 8 * 1024 * 1024;
+/** Largest JSONL frame buffered and parsed, excluding its newline, in decoded UTF-16 code units. */
+export const RPC_MAX_FRAME_CHARS = 8 * 1024 * 1024;
+const RPC_FRAME_TYPE_PREFIX_CHARS = 256;
 const MAX_DISCARDED_FRAME_CHARS = 512 * 1024 * 1024;
 
 interface PendingRequest {
+  command: unknown;
   resolve: (data: unknown) => void;
   reject: (error: Error) => void;
   timer?: ReturnType<typeof setTimeout>;
+  onResponse: ((response: unknown) => void) | undefined;
 }
 
 export function spawnChildRpc(command: readonly string[], options: { cwd: string; env?: NodeJS.ProcessEnv }): ChildRpc {
@@ -59,13 +96,16 @@ export function spawnChildRpc(command: readonly string[], options: { cwd: string
   const eventListeners = new Set<(event: Record<string, unknown>) => void>();
   const exitListeners = new Set<(exit: RpcExit) => void>();
   let exitInfo: RpcExit | undefined;
-  /** Set once the channel is settled (pending rejected, listeners fired). */
+  /** Set once process exit bookkeeping and listener notification are complete. */
   let channelDone = false;
   let stderr = "";
   let requestId = 0;
   let stdoutBuffer = "";
   let discardedFrameChars: number | undefined;
-  let stdoutDiscardFailed = false;
+  let discardedFrameType: string | undefined;
+  let totalDiscardedFrameChars = 0;
+  /** Set synchronously on the first terminal fault, before process reap. */
+  let channelFailure: Error | undefined;
   // Decode across chunk boundaries so a multibyte UTF-8 sequence split between
   // two reads is not corrupted (plain chunk.toString would mangle it).
   const stdoutDecoder = new StringDecoder("utf8");
@@ -90,22 +130,20 @@ export function spawnChildRpc(command: readonly string[], options: { cwd: string
   });
 
   child.stdout.on("data", (chunk: Buffer) => {
-    if (channelDone) return; // A settled channel buffers and dispatches nothing.
+    if (channelFailure !== undefined) return; // Frames after a terminal fault are untrustworthy.
     drainStdoutLines(stdoutDecoder.write(chunk));
   });
 
   function drainStdoutLines(decoded = "", endOfStream = false): void {
-    if (stdoutDiscardFailed) return;
+    if (channelFailure !== undefined) return;
     let offset = 0;
     while (offset < decoded.length) {
       if (discardedFrameChars !== undefined) {
         const newline = decoded.indexOf("\n", offset);
         const end = newline === -1 ? decoded.length : newline;
-        discardedFrameChars += end - offset;
-        if (failIfDiscardLimitExceeded()) return;
+        if (discardFrameCharacters(end - offset)) return;
         if (newline === -1) break;
-        reportDiscardedFrame(discardedFrameChars);
-        discardedFrameChars = undefined;
+        reportDiscardedFrame();
         offset = newline + 1;
         continue;
       }
@@ -113,13 +151,22 @@ export function spawnChildRpc(command: readonly string[], options: { cwd: string
       const newline = decoded.indexOf("\n", offset);
       const end = newline === -1 ? decoded.length : newline;
       const segmentLength = end - offset;
-      if (stdoutBuffer.length + segmentLength > MAX_LINE_CHARS) {
-        discardedFrameChars = stdoutBuffer.length + segmentLength;
+      if (stdoutBuffer.length + segmentLength > RPC_MAX_FRAME_CHARS) {
+        const characters = stdoutBuffer.length + segmentLength;
+        const prefix = stdoutBuffer.length >= RPC_FRAME_TYPE_PREFIX_CHARS
+          ? stdoutBuffer.slice(0, RPC_FRAME_TYPE_PREFIX_CHARS)
+          : stdoutBuffer + decoded.slice(offset, offset + RPC_FRAME_TYPE_PREFIX_CHARS - stdoutBuffer.length);
+        const frameType = /"type":"([^"\\]*)"/.exec(prefix)?.[1];
         stdoutBuffer = "";
-        if (failIfDiscardLimitExceeded()) return;
+        if (frameType === undefined || prefix.includes('"type":"response"')) {
+          failOversizedFrame(characters);
+          return;
+        }
+        discardedFrameChars = 0;
+        discardedFrameType = frameType;
+        if (discardFrameCharacters(characters)) return;
         if (newline === -1) break;
-        reportDiscardedFrame(discardedFrameChars);
-        discardedFrameChars = undefined;
+        reportDiscardedFrame();
         offset = newline + 1;
         continue;
       }
@@ -136,44 +183,69 @@ export function spawnChildRpc(command: readonly string[], options: { cwd: string
           message = undefined; // Non-protocol stdout noise must not kill the channel.
         }
         if (message) handleMessage(message);
+        if (channelFailure !== undefined) return;
       }
       offset = newline + 1;
     }
 
-    if (endOfStream && discardedFrameChars !== undefined) {
-      reportDiscardedFrame(discardedFrameChars);
-      discardedFrameChars = undefined;
-    }
+    if (endOfStream && discardedFrameChars !== undefined) reportDiscardedFrame();
   }
 
-  function failIfDiscardLimitExceeded(): boolean {
-    if (discardedFrameChars === undefined || discardedFrameChars <= MAX_DISCARDED_FRAME_CHARS) return false;
-    const total = discardedFrameChars;
-    discardedFrameChars = undefined;
-    stdoutDiscardFailed = true;
-    failChannel(
-      { code: null, signal: null },
-      `Child RPC frame exceeded the ${MAX_LINE_CHARS}-character buffer cap and ${MAX_DISCARDED_FRAME_CHARS}-character hard discard limit; discarded ${total} characters without a newline; channel desynchronized`,
+  function discardFrameCharacters(characters: number): boolean {
+    if (discardedFrameChars === undefined) return false;
+    discardedFrameChars += characters;
+    totalDiscardedFrameChars += characters;
+    if (totalDiscardedFrameChars <= MAX_DISCARDED_FRAME_CHARS) return false;
+    const observedTotal = totalDiscardedFrameChars;
+    reportDiscardedFrame();
+    const failure = new RpcFrameTooLargeError(
+      `Child RPC oversized-frame discard total exceeded the ${MAX_DISCARDED_FRAME_CHARS}-character hard limit (${observedTotal} characters discarded)`,
     );
+    failChannel({ code: null, signal: null }, failure.message, failure);
     return true;
   }
 
-  function reportDiscardedFrame(characters: number): void {
-    // pi awaits stdout backpressure inside its agent loop, so every frame must
-    // be drained. Only transcript-sized events can exceed this cap; response,
-    // agent_start, agent_settled, and turn_end frames are bounded by model
-    // output limits and remain safe.
-    reportDiagnostic(`[subagent-workflow] discarded oversized child RPC frame of approximately ${characters} characters (buffer cap ${MAX_LINE_CHARS})`);
+  function reportDiscardedFrame(): void {
+    if (discardedFrameChars === undefined || discardedFrameType === undefined) return;
+    reportDiagnostic(
+      `[subagent-workflow] discarded oversized child RPC event frame of type ${JSON.stringify(discardedFrameType)} (${discardedFrameChars} characters; transport cap ${RPC_MAX_FRAME_CHARS})`,
+    );
+    discardedFrameChars = undefined;
+    discardedFrameType = undefined;
+  }
+
+  function failOversizedFrame(characters: number): void {
+    const failure = new RpcFrameTooLargeError(
+      `Child RPC frame exceeded the ${RPC_MAX_FRAME_CHARS}-character transport cap (${characters} characters observed)`,
+    );
+    failChannel({ code: null, signal: null }, failure.message, failure);
   }
 
   function handleMessage(message: Record<string, unknown>): void {
+    if (channelFailure !== undefined) return;
     if (message.type === "response" && typeof message.id === "string") {
       const request = pending.get(message.id);
       if (!request) return;
+      if (message.command !== request.command || typeof message.success !== "boolean") {
+        const failure = new RpcProtocolError(
+          `Malformed correlated RPC response for ${String(request.command)}: expected matching command and boolean success`,
+        );
+        failChannel({ code: null, signal: null }, failure.message, failure);
+        return;
+      }
       pending.delete(message.id);
       if (request.timer) clearTimeout(request.timer);
-      if (message.success === true) request.resolve(message.data);
-      else request.reject(new Error(typeof message.error === "string" ? message.error : `RPC ${String(message.command)} failed`));
+      if (message.success) {
+        try {
+          request.onResponse?.(message.data);
+        } catch (error) {
+          request.reject(error instanceof Error ? error : new Error(String(error)));
+          return;
+        }
+        request.resolve(message.data);
+      } else {
+        request.reject(new RpcCommandRejectedError(typeof message.error === "string" ? message.error : `RPC ${String(request.command)} failed`));
+      }
       return;
     }
     if (typeof message.type === "string") {
@@ -185,19 +257,33 @@ export function spawnChildRpc(command: readonly string[], options: { cwd: string
     }
   }
 
-  /** Settle the channel exactly once: reject pending, notify exit listeners. */
+  /**
+   * Record the first terminal failure and atomically close request/response and
+   * event dispatch. Process exit notification remains owned by settleChannel.
+   */
+  function closeRequestPlane(failure: Error): void {
+    if (channelFailure !== undefined) return;
+    channelFailure = failure;
+    stdoutBuffer = "";
+    discardedFrameChars = undefined;
+    discardedFrameType = undefined;
+    for (const request of pending.values()) {
+      if (request.timer) clearTimeout(request.timer);
+      request.reject(failure);
+    }
+    pending.clear();
+  }
+
+  /** Settle process exit exactly once and notify exit listeners. */
   function settleChannel(result: RpcExit, reason?: string): void {
     if (settleGrace) { clearTimeout(settleGrace); settleGrace = undefined; }
     if (channelDone) return;
     channelDone = true;
     exitInfo ??= result;
     const detail = reason ? `${reason}. ` : "";
-    const failure = new Error(`${detail}Child pi channel closed (code ${exitInfo.code ?? "null"}, signal ${exitInfo.signal ?? "null"}). Stderr: ${stderr || "(empty)"}`);
-    for (const request of pending.values()) {
-      if (request.timer) clearTimeout(request.timer);
-      request.reject(failure);
-    }
-    pending.clear();
+    closeRequestPlane(channelFailure ?? new RpcChannelClosedError(
+      `${detail}Child pi channel closed (code ${exitInfo.code ?? "null"}, signal ${exitInfo.signal ?? "null"}). Stderr: ${stderr || "(empty)"}`,
+    ));
     resolveExited(exitInfo);
     for (const listener of exitListeners) {
       try { listener(exitInfo); } catch (error) {
@@ -208,12 +294,11 @@ export function spawnChildRpc(command: readonly string[], options: { cwd: string
   }
 
   /**
-   * Force the channel down on a fatal I/O error. When a real process exists,
-   * kill it and let the exit/close path settle, so `exited` never resolves
-   * ahead of the OS process actually being gone; settle directly only when
-   * there is no process to wait for (spawn failure).
+   * Force the channel down on a terminal fault. The request plane closes now,
+   * but `exited` waits for the existing process reap path when a child exists.
    */
-  function failChannel(result: RpcExit, reason: string): void {
+  function failChannel(result: RpcExit, reason: string, failure: Error = new RpcChannelClosedError(reason)): void {
+    closeRequestPlane(failure);
     stderr = (stderr + `\n${reason}`).slice(-STDERR_TAIL_MAX);
     const processGone = exitInfo !== undefined || child.exitCode !== null || child.signalCode !== null;
     if (!processGone) killProcessGroup("SIGKILL");
@@ -249,10 +334,10 @@ export function spawnChildRpc(command: readonly string[], options: { cwd: string
 
   return {
     request(command: Record<string, unknown>, requestOptions?: RpcRequestOptions): Promise<unknown> {
-      if (channelDone) return Promise.reject(new Error(`Child pi channel already closed (code ${exitInfo?.code ?? "null"}, signal ${exitInfo?.signal ?? "null"})`));
+      if (channelFailure !== undefined) return Promise.reject(channelFailure);
       const id = `req-${++requestId}`;
       return new Promise((resolve, reject) => {
-        const entry: PendingRequest = { resolve, reject };
+        const entry: PendingRequest = { command: command.type, resolve, reject, onResponse: requestOptions?.onResponse };
         if (requestOptions?.timeoutMs !== undefined) {
           entry.timer = setTimeout(() => {
             if (!pending.delete(id)) return;
@@ -263,16 +348,25 @@ export function spawnChildRpc(command: readonly string[], options: { cwd: string
         pending.set(id, entry);
         child.stdin.write(`${JSON.stringify({ ...command, id })}\n`, (error) => {
           if (!error) return;
-          if (!pending.delete(id)) return;
-          if (entry.timer) clearTimeout(entry.timer);
-          reject(new Error(`Child RPC write failed: ${errorMessage(error)}`));
+          const failure = new RpcChannelClosedError(
+            `Child RPC request write failed: ${errorMessage(error)}`,
+            { cause: error },
+          );
+          // Keep this request in the shared pending set. settleChannel owns timer
+          // cleanup and rejects every request with the same terminal failure.
+          failChannel({ code: null, signal: null }, failure.message, failure);
         });
       });
     },
     send(message: Record<string, unknown>): void {
-      if (channelDone) return;
+      if (channelFailure !== undefined) return;
       child.stdin.write(`${JSON.stringify(message)}\n`, (error) => {
-        if (error) reportDiagnostic(`[subagent-workflow] child RPC send failed: ${errorMessage(error)}`);
+        if (!error) return;
+        const failure = new RpcChannelClosedError(
+          `Child RPC send write failed: ${errorMessage(error)}`,
+          { cause: error },
+        );
+        failChannel({ code: null, signal: null }, failure.message, failure);
       });
     },
     onEvent(listener) {

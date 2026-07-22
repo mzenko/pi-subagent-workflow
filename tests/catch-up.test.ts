@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -18,7 +18,9 @@ import {
   writeDeliveryMarker,
 } from "../src/store/delivery-marker.js";
 import { acquireRunOwnership } from "../src/store/lease.js";
-import { encodeCwd, RunStore } from "../src/store/run-store.js";
+import { projectRunSnapshot } from "../src/store/run-projection.js";
+import { encodeCwd, reconcileProjectionWrites, RunStore } from "../src/store/run-store.js";
+import { readRunSnapshot } from "../src/store/run-snapshot.js";
 
 const CWD = "/work/catch-up";
 const SESSION_ID = "session-current";
@@ -37,7 +39,7 @@ test("startup catch-up publishes only after the matching user message_start", ()
   try {
     expect(catchUpUndeliveredRuns(pi, context(), runsRoot).map((run) => run.runId)).toEqual(["run-selected"]);
     expect(messages).toEqual([
-      `Recovered background run deliveries:\n- run-selected | Selected work | completed | ${selected}`,
+      `Recovered background run deliveries:\n- run-selected | Selected work | completed: run finished before its result was delivered | last activity unknown | review result from ${selected}`,
     ]);
     expect(existsSync(join(selected, "delivered.json"))).toBe(false);
 
@@ -54,6 +56,182 @@ test("startup catch-up publishes only after the matching user message_start", ()
     const ownership = acquireRunOwnership(selected);
     ownership.release();
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("dead-owner catch-up reconciles live run state before delivery", () => {
+  const root = mkdtempSync(join(tmpdir(), "catch-up-reconcile-"));
+  const runsRoot = join(root, "runs");
+  const runDir = runFixture(runsRoot, CWD, "run-crashed", {
+    sessionId: SESSION_ID,
+    label: "Interrupted work",
+    status: "running",
+  });
+  writeFileSync(join(runDir, "events.jsonl"), `${JSON.stringify({
+    timestamp: "2026-01-01T00:01:00.000Z",
+    type: "status",
+    id: "child-1",
+    status: "running",
+  })}\n`);
+  const messages: string[] = [];
+  const pi = { sendUserMessage: (message: string) => { messages.push(message); } } as unknown as ExtensionAPI;
+  try {
+    const runs = catchUpUndeliveredRuns(pi, context(), runsRoot);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({
+      runId: "run-crashed",
+      status: "aborted",
+      interruptedChildCount: 1,
+      lastActivityAt: Date.parse("2026-01-01T00:01:00.000Z"),
+      reason: "parent process exited while 1 agent was running",
+      recommendedAction: "restart or resume from",
+    });
+
+    const status = JSON.parse(readFileSync(join(runDir, "status.json"), "utf8"));
+    expect(status.status).toBe("aborted");
+    expect(status.children["child-1"].status).toBe("aborted");
+    const events = readFileSync(join(runDir, "events.jsonl"), "utf8")
+      .trim().split("\n").map((line) => JSON.parse(line));
+    expect(events.at(-1)).toMatchObject({
+      type: "crash_reconciled",
+      generation: 1,
+      status: "aborted",
+      interruptedChildIds: ["child-1"],
+    });
+    expect(messages).toEqual([
+      `Recovered background run deliveries:\n- run-crashed | Interrupted work | aborted: parent process exited while 1 agent was running | last activity 2026-01-01T00:01:00.000Z | restart or resume from ${runDir}`,
+    ]);
+    expect(existsSync(join(runDir, "delivered.json"))).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("dead-owner reconciliation persists record-only children as aborted", () => {
+  const root = mkdtempSync(join(tmpdir(), "catch-up-record-only-"));
+  const runsRoot = join(root, "runs");
+  const runDir = runFixture(runsRoot, CWD, "run-record-only", {
+    sessionId: SESSION_ID,
+    status: "running",
+  });
+  writeFileSync(join(runDir, "status.json"), `${JSON.stringify({ status: "running", children: {} })}\n`);
+  const pi = { sendUserMessage: () => {} } as unknown as ExtensionAPI;
+  try {
+    const runs = catchUpUndeliveredRuns(pi, context(), runsRoot);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({
+      status: "aborted",
+      interruptedChildCount: 1,
+      reason: "parent process exited while 1 agent was running",
+    });
+
+    const status = JSON.parse(readFileSync(join(runDir, "status.json"), "utf8"));
+    expect(status.children["child-1"]).toEqual({
+      status: "aborted",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+    });
+    const projection = projectRunSnapshot(readRunSnapshot(runDir), "run-record-only");
+    expect(projection.detail.children.map((child) => child.status)).toEqual(["aborted"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  ["completed", "review result from"],
+  ["failed", "inspect or resume from"],
+] as const)("terminal %s events override stale running status without reporting interruption", (terminal, recommendedAction) => {
+  const root = mkdtempSync(join(tmpdir(), `catch-up-terminal-${terminal}-`));
+  const runsRoot = join(root, "runs");
+  const runDir = runFixture(runsRoot, CWD, `run-${terminal}-event`, {
+    sessionId: SESSION_ID,
+    status: "running",
+  });
+  writeFileSync(join(runDir, "events.jsonl"), `${JSON.stringify(terminalResultEvent(terminal))}\n`);
+  const pi = { sendUserMessage: () => {} } as unknown as ExtensionAPI;
+  try {
+    const runs = catchUpUndeliveredRuns(pi, context(), runsRoot);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({
+      status: terminal,
+      interruptedChildCount: 0,
+      reason: "run finished before its result was delivered",
+      recommendedAction,
+    });
+
+    const status = JSON.parse(readFileSync(join(runDir, "status.json"), "utf8"));
+    expect(status.status).toBe(terminal);
+    expect(status.children["child-1"].status).toBe(terminal);
+    const crashEvents = readEvents(runDir).filter((event) => event.type === "crash_reconciled");
+    expect(crashEvents).toHaveLength(1);
+    expect(crashEvents[0]).toMatchObject({
+      status: terminal,
+      interruptedChildIds: [],
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("catch-up last activity includes persisted child activity events", () => {
+  const root = mkdtempSync(join(tmpdir(), "catch-up-activity-"));
+  const runsRoot = join(root, "runs");
+  const runDir = runFixture(runsRoot, CWD, "run-activity", {
+    sessionId: SESSION_ID,
+    status: "running",
+  });
+  writeFileSync(join(runDir, "events.jsonl"), [
+    JSON.stringify({
+      timestamp: "2026-01-01T00:01:00.000Z",
+      type: "status",
+      id: "child-1",
+      status: "running",
+    }),
+    JSON.stringify({
+      timestamp: "2026-01-01T00:02:00.000Z",
+      type: "activity",
+      id: "child-1",
+      description: "running tool",
+    }),
+    "",
+  ].join("\n"));
+  const pi = { sendUserMessage: () => {} } as unknown as ExtensionAPI;
+  try {
+    const runs = catchUpUndeliveredRuns(pi, context(), runsRoot);
+    expect(runs[0]?.lastActivityAt).toBe(Date.parse("2026-01-01T00:02:00.000Z"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("reconcile status-write failure is idempotent and retryable after the crash event", () => {
+  const root = mkdtempSync(join(tmpdir(), "catch-up-reconcile-failure-"));
+  const runsRoot = join(root, "runs");
+  const runDir = runFixture(runsRoot, CWD, "run-write-failure", {
+    sessionId: SESSION_ID,
+    status: "running",
+  });
+  const messages: string[] = [];
+  const pi = { sendUserMessage: (message: string) => { messages.push(message); } } as unknown as ExtensionAPI;
+  const writeStatus = reconcileProjectionWrites.writeStatus;
+  try {
+    reconcileProjectionWrites.writeStatus = () => { throw new Error("injected status write failure"); };
+    expect(catchUpUndeliveredRuns(pi, context(), runsRoot)).toEqual([]);
+    expect(messages).toEqual([]);
+    expect(existsSync(join(runDir, "delivered.json"))).toBe(false);
+    expect(JSON.parse(readFileSync(join(runDir, "status.json"), "utf8")).status).toBe("running");
+    const firstCrashEvents = readEvents(runDir).filter((event) => event.type === "crash_reconciled");
+    expect(firstCrashEvents).toHaveLength(1);
+    expect(firstCrashEvents[0]?.generation).toBe(1);
+
+    reconcileProjectionWrites.writeStatus = writeStatus;
+    expect(catchUpUndeliveredRuns(pi, context(), runsRoot).map((run) => run.runId)).toEqual(["run-write-failure"]);
+    expect(JSON.parse(readFileSync(join(runDir, "status.json"), "utf8")).status).toBe("aborted");
+    expect(readEvents(runDir).filter((event) => event.type === "crash_reconciled")).toHaveLength(1);
+    expect(messages).toHaveLength(1);
+  } finally {
+    reconcileProjectionWrites.writeStatus = writeStatus;
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -270,6 +448,26 @@ test("legacy v2 terminal records are skipped instead of redelivered", () => {
   }
 });
 
+test("direct-delivery runs are skipped while ordinary undelivered terminal runs remain eligible", () => {
+  const root = mkdtempSync(join(tmpdir(), "catch-up-direct-delivery-"));
+  const runsRoot = join(root, "runs");
+  const direct = runFixture(runsRoot, CWD, "run-direct", { sessionId: SESSION_ID });
+  runFixture(runsRoot, CWD, "run-ordinary", { sessionId: SESSION_ID });
+  const recordPath = join(direct, "run.json");
+  const record = JSON.parse(readFileSync(recordPath, "utf8")) as Record<string, unknown>;
+  writeFileSync(recordPath, `${JSON.stringify({ ...record, directDelivery: true })}\n`);
+  const messages: string[] = [];
+  const pi = { sendUserMessage: (message: string) => { messages.push(message); } } as unknown as ExtensionAPI;
+  try {
+    expect(catchUpUndeliveredRuns(pi, context(), runsRoot).map((run) => run.runId)).toEqual(["run-ordinary"]);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toContain("run-ordinary");
+    expect(messages[0]).not.toContain("run-direct");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("live-owned and quarantined runs remain ineligible", () => {
   const root = mkdtempSync(join(tmpdir(), "catch-up-ineligible-"));
   const runsRoot = join(root, "runs");
@@ -285,16 +483,48 @@ test("live-owned and quarantined runs remain ineligible", () => {
   }
 });
 
-test("catch-up message formatting is compact and stable", () => {
+test("catch-up message includes stable recovery context", () => {
   expect(formatCatchUpMessage([{
     runId: "run-1",
     runDir: "/runs/run-1",
     label: "Audit routes",
     status: "failed",
+    interruptedChildCount: 2,
+    lastActivityAt: Date.parse("2026-01-01T00:02:00.000Z"),
+    reason: "parent process exited while 2 agents were running",
+    recommendedAction: "restart or resume from",
     createdAt: 1,
     generation: 3,
-  }])).toBe("Recovered background run deliveries:\n- run-1 | Audit routes | failed | /runs/run-1");
+  }])).toBe("Recovered background run deliveries:\n- run-1 | Audit routes | failed: parent process exited while 2 agents were running | last activity 2026-01-01T00:02:00.000Z | restart or resume from /runs/run-1");
 });
+
+function terminalResultEvent(status: "completed" | "failed"): Record<string, unknown> {
+  return {
+    timestamp: "2026-01-01T00:03:00.000Z",
+    type: "result",
+    id: "child-1",
+    result: {
+      id: "child-1",
+      status,
+      text: status === "completed" ? "done" : "",
+      ...(status === "failed" ? { error: "failed work" } : {}),
+      usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: 0.01, turns: 1 },
+      resolved: {
+        provider: "anthropic",
+        modelId: "claude-test",
+        thinkingLevel: "off",
+        tools: [],
+        cwd: CWD,
+        label: "Recovered child",
+      },
+    },
+  };
+}
+
+function readEvents(runDir: string): Array<Record<string, unknown>> {
+  return readFileSync(join(runDir, "events.jsonl"), "utf8")
+    .trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+}
 
 function context(): ExtensionContext {
   return {
@@ -310,7 +540,7 @@ function runFixture(
   options: {
     sessionId: string;
     label?: string;
-    status?: "completed" | "failed" | "aborted";
+    status?: "pending" | "running" | "completed" | "failed" | "aborted";
     generation?: number;
     legacy?: boolean;
     quarantined?: boolean;

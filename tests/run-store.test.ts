@@ -308,6 +308,8 @@ test("exact and edited resume atomically abort inherited live children", () => {
   expect(status.children["running-exact"].status).toBe("aborted");
   expect(Object.values(status.children).every((child: any) => child.status !== "pending" && child.status !== "running")).toBe(true);
   const events = readFileSync(join(first.runDir, "events.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  expect(events.filter((event: { type?: string }) => event.type === "workflow_started")
+    .map((event: { generation?: number }) => event.generation)).toEqual([1, 2, 3]);
   const latestStart = events.map((event: { type?: string }) => event.type).lastIndexOf("workflow_started");
   expect(events[latestStart - 1]).toMatchObject({ type: "status", id: "running-exact", status: "aborted" });
   expect(events.some((event: any) => event.id === "event-terminal-old" && event.status === "aborted")).toBe(false);

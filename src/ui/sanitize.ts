@@ -13,6 +13,69 @@ export interface SanitizedTerminalTail {
   elided: boolean;
 }
 
+/** Compact JSON-like preview with bounded traversal, output, and cycle handling. */
+export function boundedJsonPreview(value: unknown, maxChars = 120, maxNodes = 64, maxDepth = 6): string {
+  const limit = Math.max(0, maxChars);
+  if (limit === 0) return "";
+  let output = "";
+  let nodes = Math.max(0, maxNodes);
+  let truncated = false;
+  const ancestors = new Set<object>();
+  const append = (text: string): void => {
+    const remaining = limit - output.length;
+    if (text.length > remaining) truncated = true;
+    if (remaining > 0) output += text.slice(0, remaining);
+  };
+  const quote = (text: string): string => JSON.stringify(text.slice(0, limit - output.length)) ?? "\"\"";
+  const write = (current: unknown, depth: number): void => {
+    if (output.length >= limit) { truncated = true; return; }
+    if (nodes <= 0 || depth > maxDepth) { truncated = true; append("…"); return; }
+    nodes -= 1;
+    if (current === null || typeof current === "boolean") { append(String(current)); return; }
+    if (typeof current === "number") { append(Number.isFinite(current) ? String(current) : "\"<unsupported>\""); return; }
+    if (typeof current === "string") {
+      const clipped = current.slice(0, Math.max(0, limit - output.length));
+      append(quote(clipped));
+      truncated ||= clipped.length < current.length;
+      return;
+    }
+    if (typeof current !== "object") { append("\"<unsupported>\""); return; }
+    if (ancestors.has(current)) { append("\"<cycle>\""); return; }
+    try {
+      const array = Array.isArray(current);
+      if (!array && ![Object.prototype, null].includes(Object.getPrototypeOf(current))) {
+        append("\"<unsupported>\"");
+        return;
+      }
+      ancestors.add(current);
+      append(array ? "[" : "{");
+      let count = 0;
+      for (const key in current) {
+        if (!Object.hasOwn(current, key)) continue;
+        if (nodes <= 0 || output.length >= limit) { truncated = true; append(count ? ",…" : "…"); break; }
+        if (count > 0) append(",");
+        if (!array) { append(quote(key)); append(":"); }
+        try { write((current as Record<string, unknown>)[key], depth + 1); }
+        catch { append("\"<unavailable>\""); }
+        count += 1;
+      }
+      append(array ? "]" : "}");
+    } catch { append("\"<unavailable>\""); }
+    finally { ancestors.delete(current); }
+  };
+  write(value, 0);
+  if (truncated && !output.endsWith("…")) output = `${output.slice(0, Math.max(0, limit - 1))}…`;
+  return output;
+}
+
+function isBidiFormattingControl(code: number): boolean {
+  return code === 0x061c
+    || code === 0x200e
+    || code === 0x200f
+    || (code >= 0x202a && code <= 0x202e)
+    || (code >= 0x2066 && code <= 0x2069);
+}
+
 function scanTerminalText(
   parser: TerminalParser,
   value: string,
@@ -88,7 +151,7 @@ function scanTerminalText(
       parser.previousGroundCr = false;
       const output = code === 0x09
         ? "\t"
-        : code >= 0x20 && code !== 0x7f && (code < 0x80 || code > 0x9f)
+        : code >= 0x20 && code !== 0x7f && (code < 0x80 || code > 0x9f) && !isBidiFormattingControl(code)
           ? value[index]
           : undefined;
       if (output && !emit(output)) break;

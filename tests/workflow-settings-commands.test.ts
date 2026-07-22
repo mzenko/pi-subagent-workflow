@@ -1,8 +1,9 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initTheme } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import {
   confirmAutoApproval,
   formatSettings,
@@ -211,6 +212,44 @@ test("interactive enum selection requires no typed value", async () => {
   await handleSettingsCommand("", ctx, services(settings));
   expect(settings.get().workflowApproval).toBe("auto");
   expect(inputCalls).toBe(0);
+});
+
+test("settings dialog lines never exceed the render width, including the schema warning", async () => {
+  initTheme(undefined, false);
+  // A long path plus an unsupported-version file produces the widest header
+  // the dialog can render: the ~230-column reset warning that crashed pi-tui.
+  const dir = mkdtempSync(join(tmpdir(), "workflow-settings-width-padded-to-make-the-settings-path-long-"));
+  const path = join(dir, "settings.json");
+  writeFileSync(path, `${JSON.stringify({ version: 5, maxConcurrentAgents: 4 })}\n`);
+  const settings = new WorkflowSettingsStore({ path, warn: () => {} });
+  expect(settings.getWarning()).toContain("found file version 5");
+
+  const rendered: string[][] = [];
+  const ctx = context({
+    custom: async (factory: any) => {
+      const component = await factory(
+        { requestRender: () => {} },
+        { fg: (_color: string, text: string) => text, bold: (text: string) => text },
+        {},
+        () => {},
+      );
+      for (const width of [172, 40]) rendered.push(component.render(width).map((line: string) => ({ line, width })));
+      component.handleInput(""); // Escape closes the dialog.
+      return undefined;
+    },
+  });
+  await handleSettingsCommand("", ctx, services(settings));
+
+  expect(rendered).toHaveLength(2);
+  for (const frame of rendered) {
+    for (const { line, width } of frame as unknown as Array<{ line: string; width: number }>) {
+      expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+    }
+  }
+  // The warning survives wrapping: its content is spread across lines rather than cut.
+  const joined = (rendered[0] as unknown as Array<{ line: string }>).map(({ line }) => line).join(" ");
+  expect(joined).toContain("found file version 5");
+  expect(joined).toContain("left unchanged");
 });
 
 test("reset and clear approvals require confirmation", async () => {

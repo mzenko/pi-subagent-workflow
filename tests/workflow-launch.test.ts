@@ -367,6 +367,119 @@ test("a small workflow wait result uses structured JSON while background keeps p
   expect(background).toContain(stringifyDeliveryJson({ type: "workflow_result", result: { ok: true } }));
 });
 
+test("resumed workflow delivery leads with the current generation outcome and result path", () => {
+  const runDir = mkdtempSync(join(tmpdir(), "workflow-resume-delivery-"));
+  try {
+    writeFileSync(join(runDir, "run.json"), JSON.stringify({
+      runId: "workflow-resumed",
+      kind: "workflow",
+      children: [
+        { id: "child-1", spec: { label: "Research first attempt" } },
+        { id: "child-3", spec: { label: "Research retry" } },
+      ],
+    }));
+    writeFileSync(join(runDir, "status.json"), JSON.stringify({ status: "completed", children: {} }));
+    writeFileSync(join(runDir, "script.js"), "return null;\n");
+    writeFileSync(join(runDir, "events.jsonl"), [
+      { type: "workflow_started", generation: 1 },
+      { type: "status", id: "child-1", status: "failed" },
+      { type: "workflow_started", generation: 2 },
+      { type: "status", id: "child-3", status: "completed" },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n");
+
+    const delivery = formatWorkflowDelivery({
+      runId: "workflow-resumed",
+      runDir,
+      generation: 2,
+      meta: { name: "resumed", description: "test" },
+      result: { report: "x".repeat(2_000) },
+      failedChildren: [],
+    });
+
+    expect(delivery.startsWith("Workflow resumed (generation 2)\nResume outcome:")).toBe(true);
+    expect(delivery).toContain("Child child-3 (Research retry): completed");
+    expect(delivery).not.toContain("No child reached a terminal status");
+    expect(delivery).not.toContain("Child child-1");
+    expect(delivery.indexOf("Resume outcome:")).toBeLessThan(delivery.indexOf(`Result artifact: ${runDir}/result.json`));
+    expect(delivery.indexOf(`Result artifact: ${runDir}/result.json`)).toBeLessThan(delivery.indexOf("Result preview:"));
+    expect(delivery).toContain("x".repeat(500));
+    expect(Math.max(...delivery.split("\n").map((line) => line.length))).toBeLessThanOrEqual(500);
+  } finally {
+    rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
+test("resume delivery reads only the matching generation window", () => {
+  const runDir = mkdtempSync(join(tmpdir(), "workflow-resume-window-"));
+  try {
+    writeFileSync(join(runDir, "run.json"), JSON.stringify({
+      runId: "workflow-resume-window",
+      kind: "workflow",
+      children: [
+        { id: "child-current", spec: { label: "Current attempt" } },
+        { id: "child-newer", spec: { label: "Newer attempt" } },
+      ],
+    }));
+    writeFileSync(join(runDir, "status.json"), JSON.stringify({ status: "completed", children: {} }));
+    writeFileSync(join(runDir, "script.js"), "return null;\n");
+    writeFileSync(join(runDir, "events.jsonl"), [
+      { type: "workflow_started", generation: 1 },
+      { type: "status", id: "child-old", status: "failed" },
+      { type: "workflow_started", generation: 2 },
+      { type: "status", id: "child-current", status: "completed" },
+      { type: "workflow_started", generation: 3 },
+      { type: "status", id: "child-newer", status: "failed" },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n");
+
+    const delivery = formatWorkflowDelivery({
+      runId: "workflow-resume-window",
+      runDir,
+      generation: 2,
+      meta: { name: "resumed", description: "test" },
+      result: "done",
+      failedChildren: [],
+    });
+
+    expect(delivery).toContain("Child child-current (Current attempt): completed");
+    expect(delivery).not.toContain("Child child-old");
+    expect(delivery).not.toContain("Child child-newer");
+  } finally {
+    rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
+test("resume delivery reports legacy generation boundaries as unavailable", () => {
+  const runDir = mkdtempSync(join(tmpdir(), "workflow-resume-legacy-"));
+  try {
+    writeFileSync(join(runDir, "run.json"), JSON.stringify({
+      runId: "workflow-resume-legacy",
+      kind: "workflow",
+      children: [{ id: "child-legacy", spec: { label: "Legacy attempt" } }],
+    }));
+    writeFileSync(join(runDir, "status.json"), JSON.stringify({ status: "completed", children: {} }));
+    writeFileSync(join(runDir, "script.js"), "return null;\n");
+    writeFileSync(join(runDir, "events.jsonl"), [
+      { type: "workflow_started" },
+      { type: "status", id: "child-legacy", status: "completed" },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n");
+
+    const delivery = formatWorkflowDelivery({
+      runId: "workflow-resume-legacy",
+      runDir,
+      generation: 2,
+      meta: { name: "resumed", description: "test" },
+      result: "done",
+      failedChildren: [],
+    });
+
+    expect(delivery).toContain("Resume outcome:\nUnavailable; inspect");
+    expect(delivery).toContain(`${runDir}/events.jsonl`);
+    expect(delivery).not.toContain("Child child-legacy");
+  } finally {
+    rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
 test("the runner's incremental activity projection matches the batch snapshot fold", async () => {
   const rootDir = mkdtempSync(join(tmpdir(), "workflow-activity-"));
   const store = new RunStore("workflow-activity", "/work/example", "parent-1", undefined, { rootDir, kind: "workflow" });
@@ -421,7 +534,9 @@ test("the runner's incremental activity projection matches the batch snapshot fo
     expect(activity.complete).toBe(false);
     expect(formatToolActivity(activity)).toContain("[incomplete: some run records were unreadable]");
     expect(formatToolActivity(activity)).toContain(`resolved-researcher [${handles[0]!.id}]: fetch_content x2, web_search x1`);
-    expect(summarizeChildToolActivity(join(rootDir, "no-such-run"))).toEqual({ groups: [], totalChildren: 0, omittedChildren: 0, complete: false });
+    expect(summarizeChildToolActivity(join(rootDir, "no-such-run"))).toEqual({
+      groups: [], totalChildren: 0, omittedChildren: 0, omittedToolCalls: 0, complete: false,
+    });
   } finally {
     store.releaseOwnership();
     rmSync(rootDir, { recursive: true, force: true });
@@ -472,12 +587,15 @@ test("an oversized activity block is bounded at group boundaries with explicit o
   const unbounded = formatToolActivity(summary, Number.POSITIVE_INFINITY);
   expect(unbounded.length).toBeGreaterThan(4_000);
 
-  const text = formatToolActivity(summary);
-  expect(text.length).toBeLessThanOrEqual(4_500);
-  expect(text).toMatch(/\d+ more children omitted \(fold events\.jsonl/);
+  const eventsPath = `${store.runDir}/events.jsonl`;
+  const text = formatToolActivity(summary, 4_000, eventsPath);
+  expect(text.length).toBeLessThanOrEqual(4_000);
+  expect(text).toMatch(/\[\+\d+ more tool calls across \d+ more children; full activity in .*\/events\.jsonl\]/);
   const shown = text.match(/tool_\d+ x1/g) ?? [];
-  const omitted = Number(text.match(/(\d+) more children omitted/)?.[1]);
+  const omitted = Number(text.match(/\[\+(\d+) more tool calls/)?.[1]);
   expect(shown.length + omitted).toBe(64);
+  expect(text.split("\n").every((line) => line.length < 2_000)).toBe(true);
+  expect(text).toContain(`full activity in ${eventsPath}`);
 
   const delivery = formatWorkflowDelivery({
     runId: "workflow-activity-huge",
@@ -488,7 +606,21 @@ test("an oversized activity block is bounded at group boundaries with explicit o
   });
   // The bounded block leaves the result payload intact - no global truncation.
   expect(delivery).not.toContain("[truncated");
+  expect(delivery).toContain(`Activity log: ${eventsPath}`);
   expect(delivery).toContain('{"type":"workflow_result","result":"ok"}');
+});
+
+test("tool activity omission reports children even when they made no tool calls", () => {
+  const text = formatToolActivity({
+    groups: [{ count: 1, examples: [{ id: "child-shown", label: "shown" }], tools: { read: 1 } }],
+    totalChildren: 2,
+    omittedChildren: 1,
+    omittedToolCalls: 0,
+    complete: true,
+  }, 4_000, "/runs/idle/events.jsonl");
+
+  expect(text).toContain("[+0 more tool calls across 1 more children; full activity in /runs/idle/events.jsonl]");
+  expect(text).not.toContain("[+0 more tool calls; full activity");
 });
 
 test("tool activity marks unreadable run records as incomplete", async () => {
@@ -529,7 +661,7 @@ test("background delivery keeps the activity summary ahead of a truncated result
     failedChildren: [],
   });
   expect(delivery).toContain("[truncated");
-  expect(delivery).toContain("Tool activity: worker [child-1]: read x1");
+  expect(delivery).toContain("Tool activity:\nworker [child-1]: read x1");
   expect(delivery.indexOf("Tool activity")).toBeLessThan(delivery.indexOf("workflow_result"));
 });
 

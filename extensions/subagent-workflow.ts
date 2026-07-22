@@ -2,7 +2,9 @@ import { readdirSync, type Dirent } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { subagentRunner } from "../src/runner/runner.js";
+import type { ParentContext, ResolvedFollowUpSpec } from "../src/runner/child.js";
+import { subagentRunner, type SubagentRunner } from "../src/runner/runner.js";
+import { preflightSubprocessChild } from "../src/runner/subprocess/spawn-child.js";
 import { registerWorkflowSettingsCommands } from "../src/settings/commands.js";
 import {
   acknowledgeDeliveryMessage,
@@ -18,18 +20,20 @@ import {
   type RunDeliveryIdentity,
 } from "../src/store/delivery-marker.js";
 import { runOwnerIsLive } from "../src/store/lease.js";
-import { projectRunSnapshot, snapshotSaysLive } from "../src/store/run-projection.js";
-import { encodeCwd } from "../src/store/run-store.js";
-import { readRunSnapshot } from "../src/store/run-snapshot.js";
+import { isLiveStatus, projectRunSnapshot, reconcileDeadOwnerProjection, snapshotSaysLive, type RunProjection } from "../src/store/run-projection.js";
+import { encodeCwd, persistReconciledProjection } from "../src/store/run-store.js";
+import { jsonObject, readRunSnapshot, type RunSnapshot } from "../src/store/run-snapshot.js";
 import { applyLiveWorkflowSettings, globalWorkflowSettings } from "../src/settings/runtime.js";
-import { registerSubagentTool } from "../src/tool/subagent-tool.js";
+import { fenceDirectlyDeliveredRun, registerSubagentTool, resolveFollowUpSpec } from "../src/tool/subagent-tool.js";
 import { registerEntryMarkers } from "../src/ui/entry-markers.js";
-import { registerNavigator } from "../src/ui/navigator/navigator.js";
+import { registerNavigator, type NavigatorFollowUp, type NavigatorOpenContext } from "../src/ui/navigator/navigator.js";
+import { FOLLOW_UP_PROMPT_PREFIX } from "../src/ui/navigator/transcript.js";
 import { SubagentStatusWidget } from "../src/ui/status-widget.js";
 import { safeDeliveryValue } from "../src/ui/delivery-safe.js";
 import { SubagentUsageFooter } from "../src/ui/usage-footer.js";
 import { markTuiSession, reportDiagnostic } from "../src/diagnostics.js";
-import { childLabel, errorMessage, isRecord } from "../src/util.js";
+import type { SubagentResult, ThinkingLevel } from "../src/types.js";
+import { childLabel, errorMessage } from "../src/util.js";
 import { approveLaunch } from "../src/workflow/approval.js";
 import type { StartedWorkflow } from "../src/workflow/launch.js";
 import { registerSavedWorkflowCommands } from "../src/workflow/commands.js";
@@ -43,11 +47,77 @@ const CATCH_UP_RUN_CAP = 10;
 
 type TerminalStatus = "completed" | "failed" | "aborted";
 
+type NavigatorFollowUpResolver = (id: string, prompt: string, cwd: string) => ResolvedFollowUpSpec;
+
+interface NavigatorFollowUpDependencies {
+  runner?: SubagentRunner;
+  resolveFollowUp?: NavigatorFollowUpResolver;
+  preflight?: typeof preflightSubprocessChild;
+  runsRoot?: string;
+  widget?: SubagentStatusWidget;
+}
+
+
+export function createNavigatorFollowUp(
+  pi: ExtensionAPI,
+  extensionPath: string,
+  dependencies: NavigatorFollowUpDependencies = {},
+): NavigatorFollowUp {
+  const runner = dependencies.runner ?? subagentRunner;
+  const runsRoot = dependencies.runsRoot ?? join(getAgentDir(), "subagent-workflow", "runs");
+  const resolveFollowUp = dependencies.resolveFollowUp
+    ?? ((id, prompt, cwd) => resolveFollowUpSpec(id, prompt, cwd, runsRoot));
+  const preflight = dependencies.preflight ?? preflightSubprocessChild;
+
+  return {
+    send(runId, childId, prompt, ctx) {
+      const message = prompt.trim();
+      if (!message) throw new Error("Follow-up message must not be empty");
+      if (message.startsWith("/")) throw new Error("Slash commands are not supported in agent follow-up messages");
+      const resolved = resolveFollowUp(`${runId}/${childId}`, `${FOLLOW_UP_PROMPT_PREFIX}${message}`, ctx.cwd);
+      const parent: ParentContext = {
+        ctx,
+        thinkingLevel: pi.getThinkingLevel() as ThinkingLevel,
+        selfPath: extensionPath,
+      };
+      const sessionId = ctx.sessionManager.getSessionId();
+      preflight(resolved.spec, parent, { forkSessionFile: resolved.forkSessionFile });
+      // directDelivery rides inside run.json, written before any child starts:
+      // a crash at any later point leaves a run catch-up already knows to skip.
+      const handles = runner.spawnRun([resolved], parent, { directDelivery: true });
+      const handle = handles[0];
+      if (!handle) throw new Error("Follow-up spawn did not create a child");
+      // spawnRun has persisted and started the child, so the run is committed
+      // and nothing below may throw back to the caller: a thrown send() would
+      // report a started run as a failed message and invite a duplicate spawn.
+      void Promise.all(handles.map((childHandle) => childHandle.result)).then((results: SubagentResult[]) => {
+        fenceDirectlyDeliveredRun(pi, runner, handle.runId, handle.runDir, handles, results, sessionId, (degraded) => degraded);
+        // The reply is model-fenced (directDelivery), so this notify is the
+        // only signal a user who left the navigator gets that it arrived.
+        const label = results[0]?.resolved.label ?? handle.id;
+        ctx.ui.notify(`Reply from ${safeDeliveryValue(label)} ready - see /agents`, "info");
+      }).catch((error) => {
+        reportDiagnostic(`[subagent-workflow] navigator follow-up completion failed: ${errorMessage(error)}`);
+      });
+      try {
+        dependencies.widget?.track(handle.runId, handles, false, ctx);
+      } catch (error) {
+        reportDiagnostic(`[subagent-workflow] status widget failed: ${errorMessage(error)}`);
+      }
+      return { runId: handle.runId, childId: handle.id };
+    },
+  };
+}
+
 export interface CatchUpRun {
   runId: string;
   runDir: string;
   label: string;
   status: TerminalStatus;
+  interruptedChildCount: number;
+  lastActivityAt?: number;
+  reason: string;
+  recommendedAction: string;
   createdAt: number;
   generation: number;
 }
@@ -76,21 +146,25 @@ function claimCatchUpRuns(
       const snapshot = readRunSnapshot(runDir);
       if (snapshot.generationPending) continue;
       const record = jsonObject(snapshot.record);
+      // Direct-delivery results were shown to the human in the navigator;
+      // queueing them to the model would leak a private follow-up thread.
+      if (record?.directDelivery === true) continue;
       const identity = parseRunDeliveryIdentity(record);
       // Records without a protocol identity predate acknowledgement tracking.
       // Redelivering them could create a duplicate model turn, so leave them visible only.
       if (!identity || deliveryMarkerMatches(runDir, identity)) continue;
       const parent = jsonObject(record?.parent);
       if (parent?.sessionId !== sessionId || ownerIsLive(runDir)) continue;
-      const projection = projectRunSnapshot(snapshot, entry.name, { ownerWasDead: snapshotSaysLive(snapshot) });
-      const status = projection.summary.corrupt ? undefined : terminalStatus(projection.summary.status);
-      if (!status) continue;
+      const evaluation = evaluateCatchUpRun(snapshot, entry.name);
+      if (!evaluation) continue;
+      const { liveProjection, status, interruptedChildIds } = evaluation;
       const createdAt = typeof record?.createdAt === "string" ? Date.parse(record.createdAt) : NaN;
       candidates.push({
         runId: entry.name,
         runDir,
         label: persistedRunLabel(record),
         status,
+        ...catchUpDetails(snapshot, liveProjection, status, interruptedChildIds),
         createdAt: Number.isFinite(createdAt) ? createdAt : 0,
         generation: identity.generation,
       });
@@ -112,15 +186,23 @@ function claimCatchUpRuns(
       const record = jsonObject(snapshot.record);
       const parent = jsonObject(record?.parent);
       const currentIdentity = parseRunDeliveryIdentity(record);
-      const projection = projectRunSnapshot(snapshot, candidate.runId, { ownerWasDead: snapshotSaysLive(snapshot) });
-      const status = projection.summary.corrupt ? undefined : terminalStatus(projection.summary.status);
+      const evaluation = evaluateCatchUpRun(snapshot, candidate.runId);
       if (snapshot.generationPending
         || parent?.sessionId !== sessionId
         || !currentIdentity
         || currentIdentity.generation !== identity.generation
         || deliveryMarkerMatches(candidate.runDir, identity)
-        || !status) continue;
-      claimed.push({ ...candidate, status });
+        || !evaluation) continue;
+      const { liveProjection, projection, ownerWasDead, status, interruptedChildIds } = evaluation;
+      if (ownerWasDead) {
+        try {
+          persistReconciledProjection(snapshot, projection, identity.generation, interruptedChildIds);
+        } catch (error) {
+          reportDiagnostic(`[subagent-workflow] catch-up reconcile failed for ${candidate.runDir}: ${errorMessage(error)}`);
+          continue;
+        }
+      }
+      claimed.push({ ...candidate, status, ...catchUpDetails(snapshot, liveProjection, status, interruptedChildIds) });
     } catch (error) {
       reportDiagnostic(`[subagent-workflow] catch-up claim failed for ${candidate.runDir}: ${errorMessage(error)}`);
     } finally {
@@ -132,7 +214,13 @@ function claimCatchUpRuns(
 
 export function formatCatchUpMessage(runs: readonly CatchUpRun[]): string {
   const shown = runs.slice(0, CATCH_UP_RUN_CAP);
-  const lines = shown.map((run) => [run.runId, run.label, run.status, run.runDir].map(safeDeliveryValue).join(" | "));
+  const lines = shown.map((run) => [
+    run.runId,
+    run.label,
+    `${run.status}: ${run.reason}`,
+    run.lastActivityAt === undefined ? "last activity unknown" : `last activity ${new Date(run.lastActivityAt).toISOString()}`,
+    `${run.recommendedAction} ${run.runDir}`,
+  ].map(safeDeliveryValue).join(" | "));
   if (runs.length > shown.length) lines.push(`and ${runs.length - shown.length} more; see /agents`);
   return `Recovered background run deliveries:\n${lines.map((line) => `- ${line}`).join("\n")}`;
 }
@@ -146,7 +234,7 @@ export function catchUpUndeliveredRuns(
   // was consumed in a previous session cannot be re-queued as undelivered.
   retryDeferredPublications();
   const sessionId = ctx.sessionManager.getSessionId();
-  const runs = claimCatchUpRuns(ctx.cwd, sessionId, runsRoot);
+  const runs = claimCatchUpRuns(ctx.cwd, sessionId, runsRoot, runOwnerIsLive);
   if (runs.length === 0) return runs;
   const message = formatCatchUpMessage(runs);
   queueAcknowledgedDelivery(pi, {
@@ -160,6 +248,66 @@ export function catchUpUndeliveredRuns(
 
 function catchUpIdentity(run: CatchUpRun): RunDeliveryIdentity {
   return { protocol: DELIVERY_PROTOCOL_VERSION, generation: run.generation };
+}
+
+function evaluateCatchUpRun(snapshot: RunSnapshot, runId: string) {
+  const liveProjection = projectRunSnapshot(snapshot, runId);
+  const ownerWasDead = snapshotSaysLive(snapshot);
+  const projection = ownerWasDead ? reconcileDeadOwnerProjection(liveProjection) : liveProjection;
+  const status = projection.summary.corrupt ? undefined : terminalStatus(projection.summary.status);
+  if (!status) return undefined;
+  const interruptedChildIds = ownerWasDead ? projectionInterruptedChildIds(liveProjection, projection) : [];
+  return { liveProjection, projection, ownerWasDead, status, interruptedChildIds };
+}
+
+function catchUpDetails(
+  snapshot: RunSnapshot,
+  liveProjection: RunProjection,
+  status: TerminalStatus,
+  interruptedChildIds: readonly string[],
+): Pick<CatchUpRun, "interruptedChildCount" | "lastActivityAt" | "reason" | "recommendedAction"> {
+  const interruptedChildCount = interruptedChildIds.length;
+  const lastActivityAt = projectionLastActivityAt(snapshot, liveProjection);
+  if (interruptedChildCount > 0) {
+    const agent = interruptedChildCount === 1 ? "agent was" : "agents were";
+    return {
+      interruptedChildCount,
+      ...(lastActivityAt === undefined ? {} : { lastActivityAt }),
+      reason: `parent process exited while ${interruptedChildCount} ${agent} running`,
+      recommendedAction: status === "completed" ? "review result from" : "restart or resume from",
+    };
+  }
+  return {
+    interruptedChildCount,
+    ...(lastActivityAt === undefined ? {} : { lastActivityAt }),
+    reason: "run finished before its result was delivered",
+    recommendedAction: status === "completed" ? "review result from" : "inspect or resume from",
+  };
+}
+
+function projectionInterruptedChildIds(liveProjection: RunProjection, projection: RunProjection): string[] {
+  const reconciledStatuses = new Map(projection.detail.children.map((child) => [child.id, child.status]));
+  return liveProjection.detail.children.flatMap((child) => {
+    return isLiveStatus(child.status)
+      && !liveProjection.terminalStatuses.has(child.id)
+      && reconciledStatuses.get(child.id) === "aborted"
+      ? [child.id]
+      : [];
+  });
+}
+
+function projectionLastActivityAt(snapshot: RunSnapshot, projection: RunProjection): number | undefined {
+  const timestamps = [
+    ...projection.detail.children.flatMap((child) => [child.startedAt, child.endedAt]),
+    ...projection.detail.narrator.map((line) => line.timestamp),
+    ...snapshot.events.flatMap((value) => {
+      const event = jsonObject(value);
+      if (!event || event.type === "crash_reconciled") return [];
+      const timestamp = typeof event.timestamp === "string" ? Date.parse(event.timestamp) : event.timestamp;
+      return [timestamp];
+    }),
+  ].filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0);
+  return timestamps.length > 0 ? Math.max(...timestamps) : undefined;
 }
 
 function terminalStatus(value: unknown): TerminalStatus | undefined {
@@ -178,10 +326,6 @@ function persistedRunLabel(record: Record<string, unknown> | undefined): string 
     return childLabel({ prompt: spec.prompt, ...(typeof spec.label === "string" ? { label: spec.label } : {}) });
   }
   return "subagent";
-}
-
-function jsonObject(value: unknown): Record<string, unknown> | undefined {
-  return isRecord(value) ? value : undefined;
 }
 
 function userMessageText(content: string | Array<{ type: string; text?: string }>): string {
@@ -227,6 +371,7 @@ export default function subagentWorkflow(pi: ExtensionAPI): void {
   let saveWorkflow: ReturnType<typeof registerSavedWorkflowCommands> | undefined;
   const openNavigator = registerNavigator(pi, {
     runner: subagentRunner,
+    followUp: createNavigatorFollowUp(pi, selfPath, { runner: subagentRunner, widget }),
     describeWorkflow: (script) => parseWorkflowScript(script).meta.name,
     saveWorkflowScript: async (runId, ctx) => saveWorkflow?.(runId, ctx),
   });

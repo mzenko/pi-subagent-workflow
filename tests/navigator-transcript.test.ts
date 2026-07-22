@@ -4,13 +4,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { PLAIN, type ThemeLike } from "../src/ui/format.js";
-import { UNTRUSTED_FIELD_MAX } from "../src/ui/sanitize.js";
+import { boundedJsonPreview, UNTRUSTED_FIELD_MAX } from "../src/ui/sanitize.js";
 import {
+  LARGE_RECORD_SCAN_OMISSION,
   messagesToLines,
+  OVERSIZED_MESSAGE_OMISSION,
+  OVERSIZED_RECORD_OMISSION,
   readSessionMessages,
   SESSION_ENTRY_MAX_BYTES,
+  SESSION_RECORD_MAX_COUNT,
+  SESSION_SCAN_MAX_BYTES,
   sessionEntriesToMessages,
   TRANSCRIPT_MAX_LINES,
+  UNSCANNED_TRANSCRIPT_OMISSION,
 } from "../src/ui/navigator/transcript.js";
 
 function exactAssistantRecord(byteLength: number, prefix: string): { record: string; content: string } {
@@ -81,14 +87,256 @@ test("readSessionMessages returns a placeholder for malformed session input", ()
   ]);
 });
 
-test("readSessionMessages skips an oversized newest record and returns older messages", () => {
+test("readSessionMessages marks an oversized complete message in chronological position", () => {
   const dir = mkdtempSync(join(tmpdir(), "nav-session-"));
   const path = join(dir, "oversized.jsonl");
   const older = { type: "message", message: { role: "assistant", content: "older survives" } };
   const oversized = { type: "message", message: { role: "toolResult", content: "x".repeat(512 * 1024) } };
   writeFileSync(path, `${JSON.stringify(older)}\n${JSON.stringify(oversized)}\n`);
 
-  expect(readSessionMessages(path)).toEqual([{ role: "assistant", content: "older survives" }]);
+  expect(readSessionMessages(path)).toEqual([
+    { role: "assistant", content: "older survives" },
+    { role: "toolResult", content: OVERSIZED_MESSAGE_OMISSION, toolName: "result" },
+  ]);
+});
+
+test("readSessionMessages preserves one bounded marker for each oversized complete message", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "nav-session-")), "oversized-order.jsonl");
+  const entries = [
+    { type: "message", message: { role: "user", content: "before" } },
+    { type: "message", message: { role: "assistant", content: "x".repeat(SESSION_ENTRY_MAX_BYTES) } },
+    { type: "message", message: { role: "assistant", content: "between" } },
+    { type: "message", message: { role: "toolResult", content: "y".repeat(SESSION_ENTRY_MAX_BYTES) } },
+    { type: "message", message: { role: "user", content: "after" } },
+  ];
+  writeFileSync(path, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+
+  const messages = readSessionMessages(path);
+  expect(messages.map((message) => message.content)).toEqual([
+    "before",
+    OVERSIZED_MESSAGE_OMISSION,
+    "between",
+    OVERSIZED_MESSAGE_OMISSION,
+    "after",
+  ]);
+  expect(messages.map((message) => message.role)).toEqual(["user", "assistant", "assistant", "toolResult", "user"]);
+});
+
+test("oversized placeholders preserve user, assistant, and tool-result rendering roles", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "nav-session-")), "oversized-roles.jsonl");
+  const entries = [
+    { type: "message", message: { role: "user", content: "u".repeat(SESSION_ENTRY_MAX_BYTES) } },
+    { type: "message", message: { role: "assistant", content: "a".repeat(SESSION_ENTRY_MAX_BYTES) } },
+    {
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolCallId: "call-1",
+        toolName: "bash",
+        content: "t".repeat(SESSION_ENTRY_MAX_BYTES),
+        isError: false,
+      },
+    },
+  ];
+  writeFileSync(path, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+
+  const messages = readSessionMessages(path);
+  expect(messages).toEqual([
+    { role: "user", content: OVERSIZED_MESSAGE_OMISSION },
+    { role: "assistant", content: OVERSIZED_MESSAGE_OMISSION },
+    { role: "toolResult", content: OVERSIZED_MESSAGE_OMISSION, toolName: "bash" },
+  ]);
+  const lines = messagesToLines(messages, PLAIN, 80);
+  expect(lines).toContain("▌ user");
+  expect(lines).toContain("● assistant");
+  expect(lines).toContain("  ↳ bash");
+  expect(lines.filter((line) => line.includes(OVERSIZED_MESSAGE_OMISSION))).toHaveLength(3);
+});
+
+test("oversized role classification is independent of nested message key order", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "nav-session-")), "oversized-reordered-roles.jsonl");
+  const entries = [
+    { type: "message", message: { timestamp: 1, role: "user", content: "u".repeat(SESSION_ENTRY_MAX_BYTES) } },
+    { type: "message", message: { timestamp: 2, role: "assistant", content: "a".repeat(SESSION_ENTRY_MAX_BYTES) } },
+    { type: "message", message: { toolName: "read", timestamp: 3, role: "toolResult", content: "t".repeat(SESSION_ENTRY_MAX_BYTES) } },
+  ];
+  writeFileSync(path, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+
+  expect(readSessionMessages(path)).toEqual([
+    { role: "user", content: OVERSIZED_MESSAGE_OMISSION },
+    { role: "assistant", content: OVERSIZED_MESSAGE_OMISSION },
+    { role: "toolResult", content: OVERSIZED_MESSAGE_OMISSION, toolName: "read" },
+  ]);
+});
+
+test("oversized prefix classification skips proven non-messages but preserves uncertain and proven messages", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "nav-session-")), "oversized-prefix-classification.jsonl");
+  const entries = [
+    { type: "model_change", payload: "n".repeat(SESSION_ENTRY_MAX_BYTES) },
+    { payload: "u".repeat(SESSION_ENTRY_MAX_BYTES), type: "model_change" },
+    { type: "message", message: { role: "assistant", content: "m".repeat(SESSION_ENTRY_MAX_BYTES) } },
+  ];
+  writeFileSync(path, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+
+  expect(readSessionMessages(path)).toEqual([
+    // Type was beyond the prefix: honestly a record omission, not a message claim.
+    { role: "omission", content: OVERSIZED_RECORD_OMISSION },
+    { role: "assistant", content: OVERSIZED_MESSAGE_OMISSION },
+  ]);
+});
+
+test("oversized message-first records preserve generic chronological markers when type is beyond the prefix", () => {
+  const dir = mkdtempSync(join(tmpdir(), "nav-session-"));
+  const reordered = [
+    { message: { role: "user", content: "u".repeat(SESSION_ENTRY_MAX_BYTES) }, type: "message" },
+    { message: { role: "assistant", content: "a".repeat(SESSION_ENTRY_MAX_BYTES) }, type: "message" },
+    {
+      message: { role: "toolResult", toolName: "bash", content: "t".repeat(SESSION_ENTRY_MAX_BYTES) },
+      type: "message",
+    },
+  ];
+  const standalone = join(dir, "standalone-message-first.jsonl");
+  writeFileSync(standalone, `${JSON.stringify(reordered[1])}\n`);
+  expect(readSessionMessages(standalone)).toEqual([
+    { role: "omission", content: OVERSIZED_RECORD_OMISSION },
+  ]);
+
+  const mixed = join(dir, "mixed-message-first.jsonl");
+  writeFileSync(mixed, [
+    JSON.stringify({ type: "message", message: { role: "assistant", content: "before" } }),
+    ...reordered.map((entry) => JSON.stringify(entry)),
+    JSON.stringify({ type: "message", message: { role: "user", content: "after" } }),
+    "",
+  ].join("\n"));
+  expect(readSessionMessages(mixed)).toEqual([
+    { role: "assistant", content: "before" },
+    { role: "omission", content: OVERSIZED_RECORD_OMISSION },
+    { role: "omission", content: OVERSIZED_RECORD_OMISSION },
+    { role: "omission", content: OVERSIZED_RECORD_OMISSION },
+    { role: "user", content: "after" },
+  ]);
+});
+
+test("oversized nested values that exhaust the prefix retain an omission slot", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "nav-session-")), "oversized-nested-prefix.jsonl");
+  const oversized = {
+    message: {
+      metadata: { padding: "p".repeat(300) },
+      role: "assistant",
+      content: "x".repeat(SESSION_ENTRY_MAX_BYTES),
+    },
+    type: "message",
+  };
+  writeFileSync(path, [
+    JSON.stringify({ type: "message", message: { role: "user", content: "before" } }),
+    JSON.stringify(oversized),
+    JSON.stringify({ type: "message", message: { role: "assistant", content: "after" } }),
+    "",
+  ].join("\n"));
+
+  expect(readSessionMessages(path)).toEqual([
+    { role: "user", content: "before" },
+    { role: "omission", content: OVERSIZED_RECORD_OMISSION },
+    { role: "assistant", content: "after" },
+  ]);
+});
+
+test("oversized messages with role beyond the bounded prefix keep a generic chronological marker", () => {
+  const dir = mkdtempSync(join(tmpdir(), "nav-session-"));
+  const oversized = {
+    type: "message",
+    message: { prefixPadding: "p".repeat(300), role: "assistant", content: "x".repeat(SESSION_ENTRY_MAX_BYTES) },
+  };
+  const standalone = join(dir, "standalone.jsonl");
+  writeFileSync(standalone, `${JSON.stringify(oversized)}\n`);
+  expect(readSessionMessages(standalone)).toEqual([{ role: "omission", content: OVERSIZED_MESSAGE_OMISSION }]);
+
+  const mixed = join(dir, "mixed.jsonl");
+  writeFileSync(mixed, [
+    JSON.stringify({ type: "message", message: { role: "user", content: "before" } }),
+    JSON.stringify(oversized),
+    JSON.stringify({ type: "message", message: { role: "assistant", content: "after" } }),
+    "",
+  ].join("\n"));
+  expect(readSessionMessages(mixed)).toEqual([
+    { role: "user", content: "before" },
+    { role: "omission", content: OVERSIZED_MESSAGE_OMISSION },
+    { role: "assistant", content: "after" },
+  ]);
+});
+
+test("readSessionMessages bounds byte work inside a giant newest complete record", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "nav-session-")), "giant-newest.jsonl");
+  const older = JSON.stringify({ type: "message", message: { role: "assistant", content: "must stay hidden" } });
+  const giant = JSON.stringify({
+    type: "message",
+    message: { role: "assistant", content: "x".repeat(SESSION_SCAN_MAX_BYTES + 1024 * 1024) },
+  });
+  writeFileSync(path, `${older}\n${giant}\n`);
+
+  const messages = readSessionMessages(path);
+
+  expect(messages).toEqual([{ role: "omission", content: LARGE_RECORD_SCAN_OMISSION }]);
+  expect(messagesToLines(messages, PLAIN, 80).join("\n")).toContain("a large session record and older records not scanned");
+});
+
+test("readSessionMessages bounds byte work inside a giant unterminated newest record", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "nav-session-")), "giant-partial.jsonl");
+  const older = JSON.stringify({ type: "message", message: { role: "user", content: "must stay hidden" } });
+  const partial = JSON.stringify({
+    type: "message",
+    message: { role: "assistant", content: "x".repeat(SESSION_SCAN_MAX_BYTES + 1024 * 1024) },
+  }).slice(0, -1);
+  writeFileSync(path, `${older}\n${partial}`);
+
+  expect(readSessionMessages(path)).toEqual([{ role: "omission", content: LARGE_RECORD_SCAN_OMISSION }]);
+});
+
+test("scan omission stays before newer chronology when the byte cap lands in older history", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "nav-session-")), "giant-older.jsonl");
+  const oldest = JSON.stringify({ type: "message", message: { role: "user", content: "unscanned oldest" } });
+  const giant = JSON.stringify({
+    type: "message",
+    message: { role: "assistant", content: "x".repeat(SESSION_SCAN_MAX_BYTES + 1024 * 1024) },
+  });
+  const newest = JSON.stringify({ type: "message", message: { role: "assistant", content: "newest survives" } });
+  writeFileSync(path, `${oldest}\n${giant}\n${newest}\n`);
+
+  expect(readSessionMessages(path)).toEqual([
+    { role: "omission", content: LARGE_RECORD_SCAN_OMISSION },
+    { role: "assistant", content: "newest survives" },
+  ]);
+});
+
+test("a small record split by the scan boundary uses the generic omission marker", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "nav-session-")), "small-boundary-fragment.jsonl");
+  const older = exactAssistantRecord(128, "small-older-");
+  const boundaryFragmentBytes = 8;
+  const newer = exactAssistantRecord(SESSION_SCAN_MAX_BYTES - boundaryFragmentBytes - 2, "oversized-newer-");
+  writeFileSync(path, `${older.record}\n${newer.record}\n`);
+
+  expect(readSessionMessages(path)).toEqual([
+    { role: "omission", content: UNSCANNED_TRANSCRIPT_OMISSION },
+    { role: "assistant", content: OVERSIZED_MESSAGE_OMISSION },
+  ]);
+});
+
+test("readSessionMessages does not mark an oversized trailing partial record", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "nav-session-")), "oversized-partial.jsonl");
+  const complete = JSON.stringify({ type: "message", message: { role: "assistant", content: "complete" } });
+  const partial = JSON.stringify({ type: "message", message: { role: "assistant", content: "x".repeat(SESSION_ENTRY_MAX_BYTES) } });
+  writeFileSync(path, `${complete}\n${partial.slice(0, -1)}`);
+
+  expect(readSessionMessages(path)).toEqual([{ role: "assistant", content: "complete" }]);
+});
+
+test("readSessionMessages does not mark an oversized leading fragment", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "nav-session-")), "oversized-leading-partial.jsonl");
+  const fragment = `${"x".repeat(SESSION_ENTRY_MAX_BYTES)}\"}}`;
+  const complete = JSON.stringify({ type: "message", message: { role: "assistant", content: "complete" } });
+  writeFileSync(path, `${fragment}\n${complete}\n`);
+
+  expect(readSessionMessages(path)).toEqual([{ role: "assistant", content: "complete" }]);
 });
 
 test("readSessionMessages reconstructs a record spanning scan chunks", () => {
@@ -136,6 +384,68 @@ test("readSessionMessages silently skips a trailing partial record", () => {
   expect(readSessionMessages(path)).toEqual([{ role: "assistant", content: "complete" }]);
 });
 
+test("materialized-byte truncation emits one oldest omission before retained chronology", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "nav-session-")), "materialized-limit.jsonl");
+  const entries = Array.from({ length: 5 }, (_, index) => exactAssistantRecord(500 * 1024, `entry-${index}-`));
+  writeFileSync(path, `${entries.map(({ record }) => record).join("\n")}\n`);
+
+  const messages = readSessionMessages(path);
+  expect(messages).toEqual([
+    { role: "omission", content: UNSCANNED_TRANSCRIPT_OMISSION },
+    ...entries.slice(1).map(({ content }) => ({ role: "assistant", content })),
+  ]);
+});
+
+test("message-count truncation emits one oldest omission before the newest 512 messages", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "nav-session-")), "message-count-limit.jsonl");
+  const entries = Array.from({ length: 513 }, (_, index) => ({
+    type: "message",
+    message: { role: "assistant", content: `message-${index}` },
+  }));
+  writeFileSync(path, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+
+  const messages = readSessionMessages(path);
+  expect(messages).toHaveLength(513);
+  expect(messages[0]).toEqual({ role: "omission", content: UNSCANNED_TRANSCRIPT_OMISSION });
+  expect(messages[1]?.content).toBe("message-1");
+  expect(messages.at(-1)?.content).toBe("message-512");
+});
+
+test("message-count bound emits no omission when the file is consumed exactly", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "nav-session-")), "message-count-exact.jsonl");
+  const entries = Array.from({ length: 512 }, (_, index) => ({
+    type: "message",
+    message: { role: "assistant", content: `message-${index}` },
+  }));
+  writeFileSync(path, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+
+  const messages = readSessionMessages(path);
+  expect(messages).toHaveLength(512);
+  expect(messages[0]?.content).toBe("message-0");
+  expect(messages.at(-1)?.content).toBe("message-511");
+});
+
+test("completed-record budget bounds dense malformed history", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "nav-session-")), "dense-malformed.jsonl");
+  writeFileSync(path, "{\n".repeat(SESSION_RECORD_MAX_COUNT + 100));
+
+  expect(readSessionMessages(path)).toEqual([
+    { role: "omission", content: UNSCANNED_TRANSCRIPT_OMISSION },
+  ]);
+});
+
+test("completed-record budget skips dense valid non-message history", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "nav-session-")), "dense-non-message.jsonl");
+  const nonMessage = JSON.stringify({ type: "model_change" });
+  const newest = JSON.stringify({ type: "message", message: { role: "assistant", content: "newest survives" } });
+  writeFileSync(path, `${`${nonMessage}\n`.repeat(SESSION_RECORD_MAX_COUNT + 100)}${newest}\n`);
+
+  expect(readSessionMessages(path)).toEqual([
+    { role: "omission", content: UNSCANNED_TRANSCRIPT_OMISSION },
+    { role: "assistant", content: "newest survives" },
+  ]);
+});
+
 test("readSessionMessages bounds work on a session larger than 10 MiB and returns the newest entries", () => {
   const path = join(mkdtempSync(join(tmpdir(), "nav-session-")), "large.jsonl");
   writeFileSync(path, Buffer.alloc(11 * 1024 * 1024, 0x78));
@@ -147,8 +457,9 @@ test("readSessionMessages bounds work on a session larger than 10 MiB and return
   appendFileSync(path, `${recent.join("\n")}\n`);
 
   const messages = readSessionMessages(path);
-  expect(messages).toHaveLength(512);
-  expect(messages[0]?.content).toBe("recent-88");
+  expect(messages).toHaveLength(513);
+  expect(messages[0]).toEqual({ role: "omission", content: UNSCANNED_TRANSCRIPT_OMISSION });
+  expect(messages[1]?.content).toBe("recent-88");
   expect(messages.at(-1)?.content).toBe("recent-599");
 });
 
@@ -174,6 +485,24 @@ test("messagesToLines renders user, assistant text, tool calls, and results, wid
   expect(joined).toContain("↳ bash");
   expect(joined).toContain("file-a");
   expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
+});
+
+test("boundedJsonPreview bounds large values and marks cycles", () => {
+  const cyclic: Record<string, unknown> = { command: "pwd" };
+  cyclic.self = cyclic;
+  expect(boundedJsonPreview(cyclic)).toBe('{"command":"pwd","self":"<cycle>"}');
+
+  const preview = boundedJsonPreview({ command: "x".repeat(10_000) }, 40);
+  expect(preview.length).toBeLessThanOrEqual(40);
+  expect(preview.endsWith("…")).toBe(true);
+});
+
+test("tool-call previews support array arguments", () => {
+  const lines = messagesToLines([{
+    role: "assistant",
+    content: [{ type: "toolCall", name: "batch", arguments: ["one", { two: 2 }] }],
+  }], PLAIN, 80);
+  expect(lines.join("\n")).toContain('⚙ batch ["one",{"two":2}]');
 });
 
 test("multipart user and tool-result text preserves visual logical line boundaries", () => {

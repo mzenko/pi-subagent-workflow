@@ -599,7 +599,7 @@ function mtimeMs(path: string): number {
   }
 }
 
-function isLiveStatus(status: SubagentStatus): boolean {
+export function isLiveStatus(status: SubagentStatus): boolean {
   return status === "running" || status === "pending";
 }
 

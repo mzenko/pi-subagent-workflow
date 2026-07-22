@@ -25,8 +25,8 @@ import { AgentView } from "./agent-view.js";
 import { cycleFilter, footerHint, keyToAction, orderedChildren, runActionAvailability, type RunActionAvailability } from "./controls.js";
 import { NavigatorModel, NavigatorState } from "./model.js";
 import { pageRunDetail, renderRunDetail, renderRunList } from "./render.js";
-import type { RunDetail, RunSummary } from "./store-read.js";
-import { readSessionMessages } from "./transcript.js";
+import type { ChildRow, RunDetail, RunSummary } from "./store-read.js";
+import { readSessionMessages, type TranscriptMessage } from "./transcript.js";
 
 /** The slice of SubagentRunner the navigator needs; small enough to fake in tests. */
 export interface NavigatorRunner {
@@ -40,10 +40,16 @@ export interface NavigatorRunner {
   subscribeSpawns(listener: (run: SpawnedRun) => void): () => void;
 }
 
-export type NavigatorOpenContext = Pick<ExtensionContext, "cwd" | "hasUI" | "ui" | "sessionManager">;
+export type NavigatorOpenContext = Pick<ExtensionContext, "cwd" | "hasUI" | "ui" | "sessionManager" | "modelRegistry" | "model">;
+
+export interface NavigatorFollowUp {
+  /** Resolve + spawn; throws with a user-facing message on any refusal. */
+  send(runId: string, childId: string, prompt: string, ctx: NavigatorOpenContext): { runId: string; childId: string };
+}
 
 interface NavigatorServices {
   runner: NavigatorRunner;
+  followUp?: NavigatorFollowUp;
   /** Extract a workflow's display name from its script for run rows. */
   describeWorkflow?: (script: string) => string;
   /** Override the runs root (tests); defaults to the store location. */
@@ -142,13 +148,40 @@ function openNavigator(services: NavigatorServices, ctx: NavigatorOpenContext, m
         agentView?.dispose();
         agentView = undefined;
       };
+      const reportError = (message: string) => {
+        ctx.ui.notify(message, "error");
+        reportDiagnostic(`[subagent-workflow] ${message}`);
+      };
       const openAgentView = () => {
         disposeAgentView();
         if (state.runId && state.childId) {
-          agentView = buildAgentView(runner, tui, model, state.runId, state.childId, (message) => {
-            ctx.ui.notify(message, "error");
-            reportDiagnostic(`[subagent-workflow] ${message}`);
-          });
+          const sourceRunId = state.runId;
+          const sourceChildId = state.childId;
+          agentView = buildAgentView(runner, tui, model, sourceRunId, sourceChildId, reportError, services.followUp ? {
+            onMessage: (text) => {
+              let target: { runId: string; childId: string };
+              try {
+                target = services.followUp!.send(sourceRunId, sourceChildId, text, ctx);
+              } catch (error) {
+                reportError(`Could not message agent ${sanitizeTerminalText(sourceChildId)}: ${sanitizeTerminalText(errorMessage(error))}`);
+                return false;
+              }
+
+              try {
+                state.filter = "all";
+                const children = orderedChildren(model.detail(target.runId), state.filter);
+                const childIndex = children.findIndex((child) => child.id === target.childId);
+                if (childIndex < 0) throw new Error(`spawned child ${target.childId} is missing from run ${target.runId}`);
+                state.switchRun(target.runId);
+                state.setChildCursor(childIndex, children);
+                if (state.drill(model) !== "agent") throw new Error(`spawned child ${target.childId} could not be opened`);
+                openAgentView();
+              } catch (error) {
+                reportError(`Follow-up run ${sanitizeTerminalText(target.runId)} was started, but could not be opened: ${sanitizeTerminalText(errorMessage(error))}`);
+              }
+              return true;
+            },
+          } : undefined);
         }
       };
 
@@ -375,6 +408,7 @@ function renderContent(
       footer: footerHint({
         level: "agent",
         canSteer: agentView.canSteer,
+        canMessage: agentView.canMessage,
         canStop: agentView.canStop,
         stopArmed: agentView.isStopArmed,
         canCycle: canCycle && !agentView.composerOpen,
@@ -427,6 +461,46 @@ function navigationPageSize(tui: TUI): number {
   return Math.max(1, Math.floor((tui.terminal?.rows ?? 24) * 0.9) - 7);
 }
 
+function lastAssistant(messages: readonly TranscriptMessage[]): TranscriptMessage | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === "assistant") return messages[index];
+  }
+  return undefined;
+}
+
+function isNewerAssistant(current: TranscriptMessage, persisted: TranscriptMessage | undefined): boolean {
+  if (!persisted) return true;
+  const currentResponseId = typeof current.responseId === "string" ? current.responseId : undefined;
+  const persistedResponseId = typeof persisted.responseId === "string" ? persisted.responseId : undefined;
+  if (currentResponseId !== undefined && persistedResponseId !== undefined) return currentResponseId !== persistedResponseId;
+  if (typeof current.timestamp !== "number") return false;
+  if (typeof persisted.timestamp === "number" && current.timestamp < persisted.timestamp) return false;
+  if (typeof persisted.timestamp !== "number" || current.timestamp > persisted.timestamp) return true;
+  // Equal id-less timestamps: this is either the persisted message itself
+  // crossing the persistence boundary (suppress: splicing it again would
+  // duplicate it) or a distinct response whose provider reuses the response
+  // timestamp across every delta (keep it visible for its whole stream).
+  // Serialized content is the only identity left to tell them apart.
+  try {
+    return JSON.stringify(current.content) !== JSON.stringify(persisted.content);
+  } catch {
+    return false;
+  }
+}
+
+interface AgentFollowUpControls {
+  onMessage: (text: string) => boolean;
+}
+
+/**
+ * Display-time eligibility from the projection the view already renders; the
+ * follow-up resolver revalidates authoritatively when the message is sent.
+ */
+export function isMessageableChild(child: ChildRow | undefined): boolean {
+  if (!child?.sessionFile || child.spec.isolation === "worktree") return false;
+  return child.status === "completed" || child.status === "failed" || child.status === "aborted";
+}
+
 export function buildAgentView(
   runner: NavigatorRunner,
   tui: TUI,
@@ -434,8 +508,21 @@ export function buildAgentView(
   runId: string,
   childId: string,
   reportError: (message: string) => void = (message) => reportDiagnostic(`[subagent-workflow] ${message}`),
+  followUp?: AgentFollowUpControls,
 ): AgentView {
-  const child = () => model.detail(runId).children.find((row) => row.id === childId);
+  // One render pass reads the child row several times (header, live state,
+  // transcript path, eligibility). model.detail() bypasses the disk cache, so
+  // memoize per synchronous burst: the microtask reset keeps later frames fresh.
+  let burstChild: ChildRow | undefined;
+  let burstValid = false;
+  const child = (): ChildRow | undefined => {
+    if (!burstValid) {
+      burstChild = model.detail(runId).children.find((row) => row.id === childId);
+      burstValid = true;
+      queueMicrotask(() => { burstValid = false; });
+    }
+    return burstChild;
+  };
   const header = () => {
     const row = child();
     return { label: row?.label ?? childId, model: row?.model ?? "", status: row?.status ?? "pending", tokens: row?.tokens ?? 0 };
@@ -448,7 +535,7 @@ export function buildAgentView(
   let subscribedSession: ChildSession | undefined;
   let unsubscribeSession: (() => void) | undefined;
   const session = (): ChildSession | undefined => {
-    const next = runner.liveSession(childId);
+    const next = runner.get(childId)?.status === "running" ? runner.liveSession(childId) : undefined;
     if (next === subscribedSession) return next;
     unsubscribeSession?.();
     subscribedSession = next;
@@ -461,6 +548,19 @@ export function buildAgentView(
   let cachedMtimeMs: number | undefined;
   let cachedMissing = false;
   let cachedMessages: ReturnType<typeof readSessionMessages> = [];
+  let combinedPersisted: TranscriptMessage[] | undefined;
+  let combinedCurrent: TranscriptMessage | undefined;
+  let combinedMessages: TranscriptMessage[] | undefined;
+  const withCurrentAssistant = (persisted: TranscriptMessage[], live: ChildSession | undefined): TranscriptMessage[] => {
+    const current = live?.currentAssistant;
+    if (persisted === combinedPersisted && current === combinedCurrent && combinedMessages) return combinedMessages;
+    combinedPersisted = persisted;
+    combinedCurrent = current;
+    combinedMessages = current && isNewerAssistant(current, lastAssistant(persisted))
+      ? [...persisted, current]
+      : persisted;
+    return combinedMessages;
+  };
   const messages = () => {
     const live = session();
     const path = live?.sessionFile ?? child()?.sessionFile;
@@ -472,27 +572,27 @@ export function buildAgentView(
         cachedMissing = false;
         cachedMessages = [];
       }
-      return cachedMessages;
+      return withCurrentAssistant(cachedMessages, live);
     }
 
     try {
       const stat = statSync(path);
       if (path === cachedPath && !cachedMissing && stat.size === cachedSize && stat.mtimeMs === cachedMtimeMs) {
-        return cachedMessages;
+        return withCurrentAssistant(cachedMessages, live);
       }
       cachedPath = path;
       cachedSize = stat.size;
       cachedMtimeMs = stat.mtimeMs;
       cachedMissing = false;
     } catch {
-      if (path === cachedPath && cachedMissing) return cachedMessages;
+      if (path === cachedPath && cachedMissing) return withCurrentAssistant(cachedMessages, live);
       cachedPath = path;
       cachedSize = undefined;
       cachedMtimeMs = undefined;
       cachedMissing = true;
     }
     cachedMessages = readSessionMessages(path);
-    return cachedMessages;
+    return withCurrentAssistant(cachedMessages, live);
   };
 
   const runControl = (action: "steer" | "stop", invoke: (handle: SubagentHandle) => Promise<void>): void => {
@@ -512,6 +612,9 @@ export function buildAgentView(
       return runner.get(childId) !== undefined && (status === "running" || status === "pending");
     },
     onSteer: (text) => runControl("steer", (handle) => handle.steer(text)),
+    canMessage: followUp ? () => isMessageableChild(child()) : undefined,
+    onMessage: followUp?.onMessage,
+    onSteerUnavailable: () => reportError(`Agent ${sanitizeTerminalText(childId)} ended and cannot be steered`),
     onStop: () => runControl("stop", (handle) => handle.abort()),
     subscribe: (listener) => {
       notify = listener;

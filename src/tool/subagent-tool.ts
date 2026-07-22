@@ -19,7 +19,7 @@ import {
   type RunDeliveryIdentity,
 } from "../store/delivery-marker.js";
 import { encodeCwd, sumUsage } from "../store/run-store.js";
-import { readRunSnapshot, type RunSnapshot } from "../store/run-snapshot.js";
+import { jsonObject, readRunSnapshot, type RunSnapshot } from "../store/run-snapshot.js";
 import { hasSessionClosedMarker } from "../store/session-closed-marker.js";
 import { subagentRunner, type SubagentRunner } from "../runner/runner.js";
 import {
@@ -32,10 +32,10 @@ import {
 } from "../ui/tool-render.js";
 import { appendEntrySafely } from "../ui/entry-markers.js";
 import { buildDeliveryEnvelope, DELIVERY_ENVELOPE_BUDGET } from "../ui/delivery-envelope.js";
-import { safeDeliveryValue, stringifyDeliveryJson } from "../ui/delivery-safe.js";
+import { chunkDeliveryText, formatFailureText, safeDeliveryValue, stringifyDeliveryJson } from "../ui/delivery-safe.js";
 import type { SubagentStatusWidget } from "../ui/status-widget.js";
 import { reportDiagnostic } from "../diagnostics.js";
-import { bindAbort, childLabel, errorMessage, isRecord } from "../util.js";
+import { bindAbort, childLabel, errorMessage } from "../util.js";
 import { groupFailedChildren } from "../workflow/launch.js";
 
 export const SubagentToolParameters = Type.Object({
@@ -249,10 +249,6 @@ function candidateName(candidate: Pick<FollowUpCandidate, "runId" | "childId">):
   return `${candidate.runId}/${candidate.childId}`;
 }
 
-function jsonObject(value: unknown): Record<string, unknown> | undefined {
-  return isRecord(value) ? value : undefined;
-}
-
 function isLiveStatus(value: unknown): value is Extract<SubagentStatus, "pending" | "running"> {
   return value === "pending" || value === "running";
 }
@@ -371,7 +367,7 @@ export function registerSubagentTool(pi: ExtensionAPI, selfPath: string, widget?
           ]);
           if (settled) {
             stopStream?.();
-            return completeInlineRun(pi, runner, runId, runDir, handles, settled.results, sessionId, (degraded) => {
+            return fenceDirectlyDeliveredRun(pi, runner, runId, runDir, handles, settled.results, sessionId, (degraded) => {
               const text = formatWaitResult(runId, runDir, settled.results, degraded);
               return detailedResult(text, tracker?.snapshot(handles));
             });
@@ -483,7 +479,7 @@ export function formatDelivery(runId: string, runDir: string, results: SubagentR
     id: safeDeliveryValue(result.id),
     ...(result.sessionFile === undefined ? {} : { sessionFile: safeDeliveryValue(result.sessionFile) }),
     resolved: { ...result.resolved, label: safeDeliveryValue(result.resolved.label) },
-    ...(result.error === undefined ? {} : { error: safeDeliveryValue(result.error) }),
+    ...(result.error === undefined ? {} : { error: formatFailureText(result.error) }),
   }));
   const completedCount = deliveredResults.filter((result) => result.status === "completed").length;
   const failedCount = deliveredResults.filter((result) => result.status === "failed").length;
@@ -518,21 +514,27 @@ export function formatDelivery(runId: string, runDir: string, results: SubagentR
     auxiliaryArtifacts: deliveredResults
       .filter((result) => result.sessionFile !== undefined)
       .map((result) => `Child ${result.id} session: ${result.sessionFile}`),
-    resultPreview: stringifyDeliveryJson({ type: "subagent_results", results: deliveredResults }),
+    resultPreview: chunkDeliveryText(stringifyDeliveryJson({ type: "subagent_results", results: deliveredResults })),
     truncationMarker: degraded
       ? `[truncated - result may be incomplete at ${eventsRecord}; run persistence degraded]`
       : `[truncated - full result remains available via ${eventsRecord}]`,
   });
 }
 
-function completeInlineRun<T>(pi: ExtensionAPI, runner: SubagentRunner, runId: string, runDir: string,
+/**
+ * Complete a run whose result was delivered directly (inline tool return or
+ * navigator follow-up view): record completion, then fence catch-up so the
+ * result is never redelivered to the model. `deliver` runs between the two
+ * so an inline delivery can still surface a degraded-persistence warning.
+ */
+export function fenceDirectlyDeliveredRun<T>(pi: ExtensionAPI, runner: SubagentRunner, runId: string, runDir: string,
   handles: ReturnType<SubagentRunner["spawnRun"]>, results: SubagentResult[], sessionId: string,
   deliver: (degraded: string | undefined) => T): T {
   recordCompletedRun(pi, runId, runDir, handles, results);
   const identity = resultDeliveryIdentity(runId, results);
   const delivered = deliver(runner.markDelivered(runId));
   if (!writeDeliveryMarker(runDir, sessionId, identity)) {
-    throw new Error(`Run ${runId} changed generation before inline delivery could be recorded`);
+    throw new Error(`Run ${runId} changed generation before direct delivery could be recorded`);
   }
   return delivered;
 }

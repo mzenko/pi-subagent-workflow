@@ -1,11 +1,21 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, AssistantMessageEvent } from "@earendil-works/pi-ai";
+import type { ChildSessionEvent } from "../src/runner/child-session.js";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildChildArgs } from "../src/runner/subprocess/child-args.js";
 import { RpcChildSession } from "../src/runner/subprocess/rpc-child-session.js";
-import { spawnChildRpc, type ChildRpc, type RpcExit } from "../src/runner/subprocess/rpc-transport.js";
+import {
+  RPC_MAX_FRAME_CHARS,
+  RpcChannelClosedError,
+  RpcCommandRejectedError,
+  RpcFrameTooLargeError,
+  RpcProtocolError,
+  spawnChildRpc,
+  type ChildRpc,
+  type RpcExit,
+} from "../src/runner/subprocess/rpc-transport.js";
 
 describe("buildChildArgs", () => {
   const base = {
@@ -80,14 +90,16 @@ function fakeRpc(): ChildRpc & {
     killed: [],
     respond(command, data) { responders.set(command, data); },
     send(message) { sent.push(message); },
-    request(command) {
+    request(command, options) {
       if (exited) return Promise.reject(new Error("already exited"));
       sent.push(command);
       const type = command.type as string;
       if (responders.has(type)) {
         const scripted = responders.get(type);
-        if (typeof scripted === "function") return Promise.resolve((scripted as () => unknown)());
-        return scripted instanceof Error ? Promise.reject(scripted) : Promise.resolve(scripted);
+        const response = typeof scripted === "function" ? (scripted as () => unknown)() : scripted;
+        if (response instanceof Error) return Promise.reject(response);
+        options?.onResponse?.(response);
+        return Promise.resolve(response);
       }
       return new Promise((resolve, reject) => { pending.set(`r${++id}`, { resolve, reject, command: type }); });
     },
@@ -123,9 +135,30 @@ const assistant = (text: string, input = 0, output = 0): AssistantMessage => ({
 describe("RpcChildSession", () => {
   test("start captures the child session file from get_state", async () => {
     const rpc = fakeRpc();
-    rpc.respond("get_state", { sessionFile: "/sessions/child.jsonl" });
+    rpc.respond("get_state", { isStreaming: false, isCompacting: false, pendingMessageCount: 0, sessionFile: "/sessions/child.jsonl" });
     const session = await RpcChildSession.start(rpc);
     expect(session.sessionFile).toBe("/sessions/child.jsonl");
+  });
+
+  test("startup lifecycle frames cannot contaminate the first prompt", async () => {
+    const rpc = fakeRpc();
+    const stale = assistant("stale", 7, 9);
+    rpc.respond("get_state", () => {
+      rpc.emit({ type: "message_start", message: stale });
+      rpc.emit({ type: "message_end", message: stale });
+      rpc.emit({ type: "agent_settled" });
+      return { isStreaming: false, isCompacting: false, pendingMessageCount: 0 };
+    });
+    const session = await RpcChildSession.start(rpc);
+
+    expect(session.currentAssistant).toBeUndefined();
+    expect(session.latestAssistant).toBeUndefined();
+    expect(session.usage).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 });
+
+    rpc.respond("prompt", undefined);
+    rpc.respond("get_state", { isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+    await session.prompt("first prompt");
+    expect(session.latestAssistant).toBeUndefined();
   });
 
   test("prompt sends the message and resolves on agent_settled", async () => {
@@ -137,9 +170,125 @@ describe("RpcChildSession", () => {
     await Bun.sleep(0);
     expect(rpc.sent).toEqual([{ type: "prompt", message: "do the task" }]);
     expect(resolved).toBe(false);
+    // Settlement without this prompt's own run evidence must not complete it.
+    rpc.emit({ type: "agent_settled" });
+    await Bun.sleep(0);
+    expect(resolved).toBe(false);
+    rpc.emit({ type: "agent_start" });
     rpc.emit({ type: "agent_settled" });
     await turn;
     expect(resolved).toBe(true);
+  });
+
+  test("a stale settlement cannot complete the next sequential prompt", async () => {
+    const rpc = fakeRpc();
+    rpc.respond("prompt", undefined);
+    const session = new RpcChildSession(rpc, { sessionFile: undefined });
+
+    const first = session.prompt("first");
+    await Bun.sleep(0);
+    rpc.emit({ type: "agent_start" });
+    rpc.emit({ type: "agent_settled" });
+    await first;
+
+    let secondResolved = false;
+    const second = session.prompt("second").then(() => { secondResolved = true; });
+    await Bun.sleep(0);
+    rpc.emit({ type: "agent_settled" });
+    await Bun.sleep(0);
+    expect(secondResolved).toBe(false);
+
+    rpc.emit({ type: "agent_start" });
+    rpc.emit({ type: "agent_settled" });
+    await second;
+    expect(secondResolved).toBe(true);
+  });
+
+  test("custom message lifecycle events do not let a stale settlement complete a pending prompt", async () => {
+    const rpc = fakeRpc();
+    rpc.respond("get_state", { isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+    const session = await RpcChildSession.start(rpc);
+    rpc.respond("prompt", undefined);
+    let resolved = false;
+    const turn = session.prompt("pending prompt").then(() => { resolved = true; });
+    await Bun.sleep(0);
+
+    const custom = { role: "custom", customType: "notice", content: "outside an agent run" };
+    rpc.emit({ type: "message_start", message: custom });
+    rpc.emit({ type: "message_update", message: custom, assistantMessageEvent: { type: "citation_delta" } });
+    rpc.emit({ type: "message_end", message: custom });
+    rpc.emit({ type: "agent_settled" });
+    await Bun.sleep(0);
+    expect(resolved).toBe(false);
+
+    rpc.emit({ type: "agent_start" });
+    rpc.emit({ type: "agent_settled" });
+    await turn;
+    expect(resolved).toBe(true);
+  });
+
+  test("run activity accepts guarded prompts without agent_start", async () => {
+    const rpc = fakeRpc();
+    // Idle only for the startup handshake; every later get_state reports
+    // compacting so the idle poller can neither settle the turn nor mark it
+    // accepted. Settlement can then come only from the emitted run activity, so
+    // a fixture that is not real run evidence hangs the turn and fails the test.
+    let startupStateRead = false;
+    rpc.respond("get_state", () => {
+      if (!startupStateRead) {
+        startupStateRead = true;
+        return { isStreaming: false, isCompacting: false, pendingMessageCount: 0 };
+      }
+      return { isStreaming: false, isCompacting: true, pendingMessageCount: 0 };
+    });
+    rpc.respond("prompt", undefined);
+    const session = await RpcChildSession.start(rpc);
+    const activities = [
+      { type: "message_start", message: { role: "user", content: [] } },
+      { type: "message_update", message: { role: "assistant", content: [] }, assistantMessageEvent: { type: "citation_delta" } },
+      { type: "message_end", message: { role: "user", content: [] } },
+      { type: "turn_end", message: { role: "user", content: [] } },
+      { type: "tool_execution_start", toolCallId: "call-1", toolName: "read", args: {} },
+      { type: "tool_execution_end", toolCallId: "call-1", toolName: "read", result: {}, isError: false },
+    ];
+
+    for (const activity of activities) {
+      const turn = session.prompt("do the task");
+      await Bun.sleep(0);
+      rpc.emit(activity);
+      rpc.emit({ type: "agent_settled" });
+      await expect(turn).resolves.toBeUndefined();
+    }
+  });
+
+  test("a non-conversation-role message does not accept a guarded prompt", async () => {
+    const rpc = fakeRpc();
+    let startupStateRead = false;
+    rpc.respond("get_state", () => {
+      if (!startupStateRead) {
+        startupStateRead = true;
+        return { isStreaming: false, isCompacting: false, pendingMessageCount: 0 };
+      }
+      return { isStreaming: false, isCompacting: true, pendingMessageCount: 0 };
+    });
+    rpc.respond("prompt", undefined);
+    const session = await RpcChildSession.start(rpc);
+    const turn = session.prompt("do the task");
+    await Bun.sleep(0);
+    // A custom-role message emitted outside an agent run is not run evidence, so
+    // a stale agent_settled must not settle the pending turn.
+    const custom = { role: "custom", content: "outside a run" };
+    rpc.emit({ type: "message_start", message: custom });
+    rpc.emit({ type: "message_end", message: custom });
+    rpc.emit({ type: "agent_settled" });
+    let settled = false;
+    void turn.then(() => { settled = true; });
+    await Bun.sleep(0);
+    expect(settled).toBe(false);
+
+    rpc.emit({ type: "agent_start" });
+    rpc.emit({ type: "agent_settled" });
+    await expect(turn).resolves.toBeUndefined();
   });
 
   test("prompt rejects instead of hanging when the child dies mid-turn", async () => {
@@ -224,14 +373,61 @@ describe("RpcChildSession", () => {
     expect("messages" in session).toBe(false);
   });
 
+  test("forwards streaming events and clears currentAssistant only at settlement", () => {
+    const rpc = fakeRpc();
+    const session = new RpcChildSession(rpc, { sessionFile: undefined });
+    const partial = assistant("partial");
+    const updated = assistant("updated");
+    const final = assistant("final");
+    const update = {
+      type: "text_delta",
+      contentIndex: 0,
+      delta: "updated",
+      partial: updated,
+    } satisfies AssistantMessageEvent;
+    const seen: Array<{ event: ChildSessionEvent; current: AssistantMessage | undefined }> = [];
+    session.subscribe((event) => seen.push({ event, current: session.currentAssistant }));
+
+    rpc.emit({ type: "message_start", message: partial });
+    rpc.emit({ type: "message_update", message: updated, assistantMessageEvent: update });
+    rpc.emit({ type: "message_end", message: final });
+
+    expect(session.currentAssistant).toEqual(final);
+    expect(seen.map(({ event }) => event.type)).toEqual(["message_start", "message_update", "message_end"]);
+    expect(seen.map(({ current }) => current)).toEqual([partial, updated, final]);
+
+    // A tool-result lifecycle between assistant steps must not drop the
+    // retained assistant: only settlement hands rendering back to the file.
+    rpc.emit({ type: "message_start", message: { role: "toolResult", content: [] } });
+    rpc.emit({ type: "message_end", message: { role: "toolResult", content: [] } });
+    expect(session.currentAssistant).toEqual(final);
+
+    rpc.emit({ type: "agent_settled" });
+    expect(session.currentAssistant).toBeUndefined();
+    expect(seen.at(-1)).toEqual({ event: { type: "agent_settled" }, current: undefined });
+  });
+
+  test("forwards unknown assistant update variants opaquely and ignores unknown event types", () => {
+    const rpc = fakeRpc();
+    const session = new RpcChildSession(rpc, { sessionFile: undefined });
+    const seen: ChildSessionEvent[] = [];
+    session.subscribe((event) => seen.push(event));
+
+    rpc.emit({ type: "message_update", message: assistant("citation"), assistantMessageEvent: { type: "citation_delta", citation: "x" } });
+    rpc.emit({ type: "installed_custom_event", payload: true });
+
+    expect(seen).toEqual([{ type: "message_update", opaqueAssistantMessageUpdate: { opaqueType: "citation_delta" } }]);
+    expect(session.currentAssistant).toBeUndefined();
+  });
+
   test("forwards events to subscribers until unsubscribed", () => {
     const rpc = fakeRpc();
     const session = new RpcChildSession(rpc, { sessionFile: undefined });
     const seen: string[] = [];
     const unsubscribe = session.subscribe((event) => seen.push((event as { type: string }).type));
-    rpc.emit({ type: "tool_execution_start" });
+    rpc.emit({ type: "tool_execution_start", toolCallId: "c1", toolName: "read", args: {} });
     unsubscribe();
-    rpc.emit({ type: "tool_execution_end" });
+    rpc.emit({ type: "tool_execution_end", toolCallId: "c1", toolName: "read", result: "ok", isError: false });
     expect(seen).toEqual(["tool_execution_start"]);
   });
 
@@ -253,11 +449,12 @@ describe("RpcChildSession", () => {
     const session = new RpcChildSession(rpc, { sessionFile: undefined });
     let resolved = false;
     const disposal = Promise.resolve(session.dispose()).then(() => { resolved = true; });
+    const duplicate = session.dispose();
     await Bun.sleep(10);
     expect(rpc.killed).toEqual(["SIGTERM"]);
     expect(resolved).toBe(false);
     rpc.exit({ code: null, signal: "SIGTERM" });
-    await disposal;
+    await Promise.all([disposal, duplicate]);
     expect(resolved).toBe(true);
     expect(rpc.killed).toEqual(["SIGTERM"]);
   });
@@ -312,15 +509,70 @@ describe("spawnChildRpc transport", () => {
   });
   const spawnFake = () => tracked(spawnChildRpc([process.execPath, "-e", childScript], { cwd: process.cwd() }));
 
+  test("settles when streaming state and agent_settled share one stdout write", async () => {
+    const idle = { isStreaming: false, isCompacting: false, pendingMessageCount: 0 };
+    const running = { isStreaming: true, isCompacting: false, pendingMessageCount: 0 };
+    const script = `
+      setTimeout(() => process.stdout.write(JSON.stringify({ type: "response", id: "req-1", command: "get_state", success: true, data: ${JSON.stringify(idle)} }) + "\\n"), 20);
+      setTimeout(() => process.stdout.write(JSON.stringify({ type: "response", id: "req-2", command: "prompt", success: true }) + "\\n"), 50);
+      setTimeout(() => process.stdout.write([
+        { type: "response", id: "req-3", command: "get_state", success: true, data: ${JSON.stringify(running)} },
+        { type: "agent_settled" },
+      ].map(JSON.stringify).join("\\n") + "\\n"), 150);
+      setInterval(() => {}, 1000);
+    `;
+    const rpc = tracked(spawnChildRpc([process.execPath, "-e", script], { cwd: process.cwd() }));
+    const session = await RpcChildSession.start(rpc);
+
+    await expect(Promise.race([
+      session.prompt("do the task"),
+      Bun.sleep(1_000).then(() => { throw new Error("prompt did not settle"); }),
+    ])).resolves.toBeUndefined();
+  });
+
   test("correlates responses, fans out events, and reports failure responses", async () => {
     const rpc = spawnFake();
     const events: string[] = [];
     rpc.onEvent((event) => events.push(event.type as string));
     const state = await rpc.request({ type: "get_state" }) as { sessionFile: string };
     expect(state.sessionFile).toBe("/tmp/x.jsonl");
-    await expect(rpc.request({ type: "explode" })).rejects.toThrow("no such command");
+    await expect(rpc.request({ type: "explode" })).rejects.toBeInstanceOf(RpcCommandRejectedError);
     expect(events).toContain("hello_event");
   });
+
+  for (const [malformation, response] of [
+    ["wrong command echo", { command: "steer", success: false, error: "wrong command" }],
+    ["missing boolean success", { command: "prompt" }],
+  ] as const) {
+    test(`a correlated response with ${malformation} terminally fails the channel`, async () => {
+      const script = `
+        const frames = [
+          { type: "response", id: "req-1", ...${JSON.stringify(response)} },
+          { type: "response", id: "req-2", command: "steer", success: true, data: "too late" },
+          { type: "event_after_fault" },
+        ];
+        setTimeout(() => process.stdout.write(frames.map(JSON.stringify).join("\\n") + "\\n"), 20);
+        setInterval(() => {}, 1000);
+      `;
+      const rpc = tracked(spawnChildRpc([process.execPath, "-e", script], { cwd: process.cwd() }));
+      const events: string[] = [];
+      rpc.onEvent((event) => events.push(String(event.type)));
+      const offending = rpc.request({ type: "prompt" });
+      const concurrent = rpc.request({ type: "steer" });
+      const [offendingError, concurrentError] = await Promise.all([
+        offending.then(() => undefined, (error: unknown) => error),
+        concurrent.then(() => undefined, (error: unknown) => error),
+      ]);
+
+      expect(offendingError).toBeInstanceOf(RpcProtocolError);
+      expect(offendingError).not.toBeInstanceOf(RpcCommandRejectedError);
+      expect(concurrentError).toBe(offendingError);
+      const laterError = await rpc.request({ type: "later" }).then(() => undefined, (error: unknown) => error);
+      expect(laterError).toBe(offendingError);
+      expect(events).toEqual([]);
+      expect((await rpc.exited).signal).toBe("SIGKILL");
+    });
+  }
 
   test("rejects in-flight and later requests when the child exits, with stderr context", async () => {
     const script = `
@@ -329,11 +581,92 @@ describe("spawnChildRpc transport", () => {
     `;
     const rpc = tracked(spawnChildRpc([process.execPath, "-e", script], { cwd: process.cwd() }));
     await rpc.request({ type: "get_state" });
-    const dead = rpc.request({ type: "die" });
-    await expect(dead).rejects.toThrow(/code 3.*dying now/s);
+    const deadError = await rpc.request({ type: "die" }).then(() => undefined, (error: unknown) => error);
+    expect(deadError).toEqual(expect.objectContaining({ message: expect.stringMatching(/code 3.*dying now/s) }));
     const exit = await rpc.exited;
     expect(exit.code).toBe(3);
-    await expect(rpc.request({ type: "get_state" })).rejects.toThrow(/already closed/);
+    const laterError = await rpc.request({ type: "get_state" }).then(() => undefined, (error: unknown) => error);
+    expect(laterError).toBe(deadError);
+  });
+
+  test("request write failure rejects pending and future requests before late responses arrive", async () => {
+    const grandchildScript = [
+      "const frames = [",
+      "  { type: 'response', id: 'req-1', command: 'pending', success: true, data: 'too late' },",
+      "  { type: 'response', id: 'req-3', command: 'later', success: true, data: 'also too late' },",
+      "  { type: 'event_after_fault' },",
+      "];",
+      "setTimeout(() => process.stdout.write(frames.map(JSON.stringify).join('\\n') + '\\n', () => process.exit(0)), 100);",
+    ].join(String.fromCharCode(10));
+    const script = [
+      "const { spawn } = require('node:child_process');",
+      "const { closeSync } = require('node:fs');",
+      "const readline = require('node:readline');",
+      "process.stdin.on('error', () => {});",
+      "const input = readline.createInterface({ input: process.stdin });",
+      "input.once('line', () => {",
+      "  input.close();",
+      "  closeSync(0);",
+      `  spawn(process.execPath, ['-e', ${JSON.stringify(grandchildScript)}], { detached: true, stdio: ['ignore', 'inherit', 'ignore'] }).unref();`,
+      "  console.log(JSON.stringify({ type: 'stdin_closed' }));",
+      "});",
+      "setInterval(() => {}, 1000);",
+    ].join(String.fromCharCode(10));
+    const rpc = tracked(spawnChildRpc(["node", "-e", script], { cwd: process.cwd() }));
+    const events: string[] = [];
+    const stdinClosed = new Promise<void>((resolve) => {
+      rpc.onEvent((event) => {
+        events.push(String(event.type));
+        if (event.type === "stdin_closed") resolve();
+      });
+    });
+    const pending = rpc.request({ type: "pending" });
+    await stdinClosed;
+
+    const payload = "x".repeat(1024 * 1024);
+    const faulting = rpc.request({ type: "faulting", payload });
+    const faultingOutcome = faulting.then((value) => value, (error: unknown) => error);
+    const pendingOutcome = pending.then((value) => value, (error: unknown) => error);
+    const writeFailureDeadline = Date.now() + 1_000;
+    while (!rpc.stderrTail().includes("request write failed") && Date.now() < writeFailureDeadline) await Bun.sleep(5);
+    expect(rpc.stderrTail()).toContain("request write failed");
+    const later = rpc.request({ type: "later" });
+    const [failure, pendingError, laterError] = await Promise.all([
+      faultingOutcome,
+      pendingOutcome,
+      later.then((value) => value, (error: unknown) => error),
+    ]);
+
+    expect(failure).toBeInstanceOf(RpcChannelClosedError);
+    expect(failure).toEqual(expect.objectContaining({ message: expect.stringContaining("request write failed") }));
+    expect(pendingError).toBe(failure);
+    expect(laterError).toBe(failure);
+    expect((await rpc.exited).signal).toBe("SIGKILL");
+    expect(events).toEqual(["stdin_closed"]);
+  });
+
+  test("fire-and-forget send write failure fatally closes and reaps the channel", async () => {
+    const script = [
+      "require('node:fs').closeSync(0);",
+      "console.log(JSON.stringify({ type: 'stdin_closed' }));",
+      "setInterval(() => {}, 1000);",
+    ].join(String.fromCharCode(10));
+    const rpc = tracked(spawnChildRpc(["node", "-e", script], { cwd: process.cwd() }));
+    await new Promise<void>((resolve) => {
+      const unsubscribe = rpc.onEvent((event) => {
+        if (event.type !== "stdin_closed") return;
+        unsubscribe();
+        resolve();
+      });
+    });
+
+    rpc.send({ type: "extension_ui_response", id: "ui", cancelled: true, payload: "x".repeat(1024 * 1024) });
+    expect((await rpc.exited).signal).toBe("SIGKILL");
+    const firstLaterError = await rpc.request({ type: "later-1" }).then(() => undefined, (error: unknown) => error);
+    const secondLaterError = await rpc.request({ type: "later-2" }).then(() => undefined, (error: unknown) => error);
+    expect(firstLaterError).toBeInstanceOf(RpcChannelClosedError);
+    expect(firstLaterError).toEqual(expect.objectContaining({ message: expect.stringContaining("send write failed") }));
+    expect(secondLaterError).toBe(firstLaterError);
   });
 
   test("a child that closes stdin while alive cannot crash the parent, and requests still settle", async () => {
@@ -369,15 +702,44 @@ describe("spawnChildRpc transport", () => {
     expect(emoji?.text).toBe("caf" + String.fromCharCode(0xe9));
   });
 
-  test("discards an oversized frame across chunks and parses events and responses after its mid-chunk newline", async () => {
+  test("accepts an exact-limit escaped message_update frame with duplicated snapshots", async () => {
+    const script = [
+      "const { once } = require('node:events');",
+      "const readline = require('node:readline');",
+      `const cap = ${RPC_MAX_FRAME_CHARS};`,
+      "const heavy = String.fromCharCode(34, 92, 0, 10, 9, 13).repeat(200000);",
+      "const snapshot = { role: 'assistant', content: [{ type: 'text', text: heavy }], api: 'test', provider: 'test', model: 'tiny', usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: 'stop', timestamp: 1 };",
+      "const event = { type: 'message_update', message: snapshot, assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: heavy.slice(0, 6), partial: snapshot }, padding: '' };",
+      "const base = JSON.stringify(event);",
+      "event.padding = 'x'.repeat(cap - base.length);",
+      "const frame = JSON.stringify(event);",
+      "if (frame.length !== cap) throw new Error('frame sizing failed: ' + frame.length);",
+      "const write = async (text) => { if (!process.stdout.write(text)) await once(process.stdout, 'drain'); };",
+      "void write(frame + '\\n');",
+      "readline.createInterface({ input: process.stdin }).on('line', (line) => { const request = JSON.parse(line); void write(JSON.stringify({ type: 'response', id: request.id, command: request.type, success: true, data: { ready: true } }) + '\\n'); });",
+      "setInterval(() => {}, 1000);",
+    ].join(String.fromCharCode(10));
+    const rpc = tracked(spawnChildRpc([process.execPath, "-e", script], { cwd: process.cwd() }));
+    const events: Array<Record<string, unknown>> = [];
+    rpc.onEvent((event) => events.push(event));
+
+    await expect(rpc.request({ type: "get_state" })).resolves.toEqual({ ready: true });
+    expect(events).toHaveLength(1);
+    expect(events[0]?.type).toBe("message_update");
+    expect((events[0]?.assistantMessageEvent as { partial?: unknown })?.partial).toEqual(events[0]?.message);
+  }, 30_000);
+
+  test("discards an oversized entry_appended event as the first frame and continues normally", async () => {
     const script = [
       "const { once } = require('node:events');",
       "const write = async (text) => { if (!process.stdout.write(text)) await once(process.stdout, 'drain'); };",
       "void (async () => {",
-      "  await write('{\"type\":\"message_end\",\"message\":{\"role\":\"toolResult\",\"content\":\"');",
+      "  await write('{\"type\":\"entry_appended\",\"entry\":{\"type\":\"custom\",\"customType\":\"web-search-results\",\"data\":\"');",
       "  const chunk = 'x'.repeat(256 * 1024);",
       "  for (let index = 0; index < 33; index += 1) await write(chunk);",
-      "  await write('\"}}\\n' + JSON.stringify({ type: 'small_event' }) + '\\n' + JSON.stringify({ type: 'agent_settled' }) + '\\n' + JSON.stringify({ type: 'response', id: 'req-1', command: 'get_state', success: true, data: { ready: true } }) + '\\n');",
+      "  await write(Buffer.from([0xc3]));",
+      "  await new Promise((resolve) => setTimeout(resolve, 20));",
+      "  await write(Buffer.concat([Buffer.from([0xa9]), Buffer.from('\"}}\\n' + JSON.stringify({ type: 'small_event' }) + '\\n' + JSON.stringify({ type: 'response', id: 'req-1', command: 'get_state', success: true, data: { isStreaming: false, isCompacting: false, pendingMessageCount: 0 } }) + '\\n')]));",
       "  setTimeout(() => void write(JSON.stringify({ type: 'response', id: 'req-2', command: 'second', success: true, data: 'still-working' }) + '\\n'), 100);",
       "})();",
       "setInterval(() => {}, 1000);",
@@ -386,53 +748,120 @@ describe("spawnChildRpc transport", () => {
     try {
       const rpc = tracked(spawnChildRpc([process.execPath, "-e", script], { cwd: process.cwd() }));
       const events: string[] = [];
-      rpc.onEvent((event) => events.push(event.type as string));
-      const pending = rpc.request({ type: "get_state" });
+      rpc.onEvent((event) => events.push(String(event.type)));
 
-      await expect(pending).resolves.toEqual({ ready: true });
-      expect(events).toContain("small_event");
-      expect(events).toContain("agent_settled");
-      expect(errorLog).toHaveBeenCalledTimes(1);
-      expect(errorLog).toHaveBeenCalledWith(expect.stringMatching(/discarded oversized child RPC frame.*approximately \d+ characters.*buffer cap 8388608/i));
-
-      rpc.send({ type: "extension_ui_response", id: "ui-1" });
+      await RpcChildSession.start(rpc);
+      expect(events).toEqual(["small_event"]);
       await expect(rpc.request({ type: "second" })).resolves.toBe("still-working");
+      expect(errorLog).toHaveBeenCalledTimes(1);
+      expect(errorLog).toHaveBeenCalledWith(expect.stringMatching(
+        /discarded oversized child RPC event frame of type "entry_appended" \(\d+ characters; transport cap 8388608\)/,
+      ));
     } finally {
       errorLog.mockRestore();
     }
-  });
+  }, 30_000);
 
-  test("drops and diagnoses an oversized partial frame when stdout ends", async () => {
-    const script = "process.stdout.write('x'.repeat(8 * 1024 * 1024 + 1));";
+  test("reports an oversized unterminated event once when stdout ends", async () => {
+    const script = [
+      "const { once } = require('node:events');",
+      "const write = async (text) => { if (!process.stdout.write(text)) await once(process.stdout, 'drain'); };",
+      "void (async () => {",
+      "  await write('{\"type\":\"entry_appended\",\"entry\":{\"data\":\"');",
+      "  const chunk = 'x'.repeat(256 * 1024);",
+      "  for (let index = 0; index < 33; index += 1) await write(chunk);",
+      "  await write(Buffer.from([0xc3]));",
+      "  await new Promise((resolve) => setTimeout(resolve, 20));",
+      "  await write(Buffer.from([0xa9]));",
+      "})();",
+    ].join(String.fromCharCode(10));
     const errorLog = spyOn(console, "error").mockImplementation(() => {});
     try {
       const rpc = tracked(spawnChildRpc([process.execPath, "-e", script], { cwd: process.cwd() }));
+
       await expect(rpc.exited).resolves.toEqual({ code: 0, signal: null });
       expect(errorLog).toHaveBeenCalledTimes(1);
-      expect(errorLog).toHaveBeenCalledWith(expect.stringMatching(/discarded oversized child RPC frame/i));
+      expect(errorLog).toHaveBeenCalledWith(expect.stringMatching(
+        /discarded oversized child RPC event frame of type "entry_appended" \(\d+ characters; transport cap 8388608\)/,
+      ));
     } finally {
       errorLog.mockRestore();
     }
-  });
+  }, 30_000);
 
-  test("kills a child whose unterminated frame exceeds the hard discard limit", async () => {
+  test("fails closed when an oversized frame prefix identifies a response", async () => {
     const script = [
       "const { once } = require('node:events');",
       "process.stdout.on('error', () => {});",
-      "const chunk = 'x'.repeat(1024 * 1024);",
+      "const write = async (text) => { if (!process.stdout.write(text)) await once(process.stdout, 'drain'); };",
       "void (async () => {",
-      "  for (let index = 0; index < 513; index += 1) {",
-      "    if (!process.stdout.write(chunk)) await once(process.stdout, 'drain');",
-      "  }",
+      "  await write('{\"type\":\"response\",\"id\":\"req-1\",\"command\":\"prompt\",\"success\":true,\"data\":\"');",
+      "  const chunk = 'x'.repeat(256 * 1024);",
+      "  for (let index = 0; index < 33; index += 1) await write(chunk);",
+      "  await write('\"}\\n');",
+      "})();",
+      "setInterval(() => {}, 1000);",
+    ].join(String.fromCharCode(10));
+    const rpc = tracked(spawnChildRpc([process.execPath, "-e", script], { cwd: process.cwd() }));
+    const pending = rpc.request({ type: "prompt", message: "answer" });
+
+    await expect(pending).rejects.toBeInstanceOf(RpcFrameTooLargeError);
+    await expect(pending).rejects.toThrow(`exceeded the ${RPC_MAX_FRAME_CHARS}-character transport cap`);
+    expect((await rpc.exited).signal).toBe("SIGKILL");
+  }, 30_000);
+
+  test("fails closed when an oversized frame has no type discriminator in its prefix", async () => {
+    const script = [
+      "const { once } = require('node:events');",
+      "process.stdout.on('error', () => {});",
+      "const write = async (text) => { if (!process.stdout.write(text)) await once(process.stdout, 'drain'); };",
+      "void (async () => {",
+      "  await write('{\"padding\":\"');",
+      "  const chunk = 'x'.repeat(256 * 1024);",
+      "  for (let index = 0; index < 33; index += 1) await write(chunk);",
+      "  await write('\",\"type\":\"entry_appended\"}\\n');",
       "})();",
       "setInterval(() => {}, 1000);",
     ].join(String.fromCharCode(10));
     const rpc = tracked(spawnChildRpc([process.execPath, "-e", script], { cwd: process.cwd() }));
     const pending = rpc.request({ type: "never_answers" });
 
-    await expect(pending).rejects.toThrow(/8388608-character buffer cap.*536870912-character hard discard limit.*discarded \d+ characters without a newline/s);
+    await expect(pending).rejects.toBeInstanceOf(RpcFrameTooLargeError);
+    await expect(pending).rejects.toThrow(`exceeded the ${RPC_MAX_FRAME_CHARS}-character transport cap`);
     expect((await rpc.exited).signal).toBe("SIGKILL");
   }, 30_000);
+
+  test("fails the channel when cumulative oversized event discards exceed the hard limit", async () => {
+    const script = [
+      "const { once } = require('node:events');",
+      "process.stdout.on('error', () => {});",
+      "const write = async (text) => { if (!process.stdout.write(text)) await once(process.stdout, 'drain'); };",
+      "const chunk = 'x'.repeat(1024 * 1024);",
+      "const writeFrame = async (type, chunks) => {",
+      "  await write('{\"type\":\"' + type + '\",\"payload\":\"');",
+      "  for (let index = 0; index < chunks; index += 1) await write(chunk);",
+      "  await write('\"}\\n');",
+      "};",
+      "void (async () => { await writeFrame('entry_appended', 257); await writeFrame('message_update', 256); })();",
+      "setInterval(() => {}, 1000);",
+    ].join(String.fromCharCode(10));
+    const errorLog = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const rpc = tracked(spawnChildRpc([process.execPath, "-e", script], { cwd: process.cwd() }));
+      const pending = rpc.request({ type: "never_answers" });
+
+      await expect(pending).rejects.toBeInstanceOf(RpcFrameTooLargeError);
+      await expect(pending).rejects.toThrow(/discard total exceeded the 536870912-character hard limit/);
+      expect((await rpc.exited).signal).toBe("SIGKILL");
+      expect(errorLog).toHaveBeenCalledTimes(2);
+      expect(errorLog.mock.calls.map(([message]) => message)).toEqual([
+        expect.stringContaining('type "entry_appended"'),
+        expect.stringContaining('type "message_update"'),
+      ]);
+    } finally {
+      errorLog.mockRestore();
+    }
+  }, 60_000);
 
   test("a request deadline rejects when the child never answers", async () => {
     const script = "const readline = require('node:readline'); readline.createInterface({ input: process.stdin }).on('line', () => {}); setInterval(() => {}, 1000);";

@@ -39,6 +39,14 @@ test("renderWidgetLines collapses overflow and clamps width", () => {
   for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(30);
 });
 
+test("renderWidgetLines respects a terminal narrower than any minimum layout", () => {
+  const runs = [view({ label: "a very long workflow name that cannot fit", phase: "long phase name", tokens: 123_456 })];
+  const lines = renderWidgetLines(runs, PLAIN, 10, 1_000);
+  expect(lines.length).toBeGreaterThan(0);
+  // pi-tui kills the process on any over-wide line, so 10 means 10.
+  for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(10);
+});
+
 test("status widget row cap follows terminal height with a fixed fallback", () => {
   expect(statusWidgetRowCap(undefined)).toBe(6);
   expect(statusWidgetRowCap(12)).toBe(3);

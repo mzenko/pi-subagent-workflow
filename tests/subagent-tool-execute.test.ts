@@ -7,7 +7,7 @@ import type { ResolvedFollowUpSpec } from "../src/runner/child.js";
 import { acknowledgeDeliveryMessage, releasePendingDeliveries } from "../src/store/delivery-marker.js";
 import { acquireRunOwnership } from "../src/store/lease.js";
 import type { SubagentRunner } from "../src/runner/runner.js";
-import { registerSubagentTool, type SubagentToolInput } from "../src/tool/subagent-tool.js";
+import { formatDelivery, registerSubagentTool, type SubagentToolInput } from "../src/tool/subagent-tool.js";
 import type { ResolvedSpec, SubagentEvent, SubagentHandle, SubagentResult } from "../src/types.js";
 import type { SubagentStatusWidget } from "../src/ui/status-widget.js";
 
@@ -558,6 +558,24 @@ test("a call whose every child names an unknown model fails fast with a suggesti
   } as SubagentToolInput, undefined, undefined, { ...mixed.ctx, modelRegistry } as never);
   const text = output.content[0]?.type === "text" ? output.content[0].text : "";
   expect(parseWaitResult(text).results.map((entry) => entry.status)).toEqual(["completed", "failed"]);
+});
+
+test("subagent delivery preserves failed-child tails after exact duplicate collapse", () => {
+  const noisy = [
+    ...Array.from({ length: 25 }, () => "PDF warning"),
+    ...Array.from({ length: 80 }, (_, index) => `parser detail ${index}: ${"noise".repeat(8)}`),
+    "fatal RPC frame-cap error",
+  ].join("\n");
+  const text = formatDelivery("run-noisy", "/runs/run-noisy", [{
+    ...result("failed"),
+    error: noisy,
+  }]);
+
+  expect(text).toContain("fatal RPC frame-cap error");
+  expect(text).toContain("earlier output truncated");
+  expect(text).toContain("including 24 repeats");
+  expect(text).not.toContain("parser detail 0:");
+  expect(Math.max(...text.split("\n").map((line) => line.length))).toBeLessThanOrEqual(500);
 });
 
 test("foreground and background completion share the bounded envelope and degraded marker", async () => {

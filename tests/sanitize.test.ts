@@ -44,6 +44,24 @@ test("sanitizeTerminalText strips control bytes and terminal escape sequences", 
   expect(sanitizeTerminalText(input)).toBe("safemiddletext\tend");
 });
 
+test("sanitizeTerminalText strips bidi formatting controls", () => {
+  const input = [
+    "safe",
+    "\u061c",
+    "\u200e",
+    "\u200f",
+    "\u202aembedded\u202c",
+    "\u202doverridden\u202c",
+    "\u202ereversed\u202c",
+    "\u2066isolated\u2069",
+    "\u2067rtl isolated\u2069",
+    "\u2068first strong\u2069",
+    "end",
+  ].join("");
+
+  expect(sanitizeTerminalText(input)).toBe("safeembeddedoverriddenreversedisolatedrtl isolatedfirst strongend");
+});
+
 test("sanitizeTerminalText preserves ordinary printable text and bounds its output", () => {
   expect(sanitizeTerminalText("plain café 🙂", 8)).toBe("plain ca");
 });

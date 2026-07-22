@@ -17,6 +17,7 @@ import {
   RunOwnershipConflictError,
   type RunOwnership,
 } from "./lease.js";
+import type { RunProjection } from "./run-projection.js";
 import { readRunSnapshot, type FrozenJson, type RunSnapshot } from "./run-snapshot.js";
 import { writeSessionClosedMarker } from "./session-closed-marker.js";
 
@@ -29,6 +30,59 @@ export function sumUsage(usages: Iterable<UsageSummary>): UsageSummary {
     total.cacheWrite += usage.cacheWrite; total.cost += usage.cost; total.turns += usage.turns;
   }
   return total;
+}
+
+export const reconcileProjectionWrites = {
+  writeStatus(path: string, contents: string): void {
+    replaceAtomicFile(path, contents, {
+      mode: 0o600,
+      fsync: true,
+      syncParentDirectory: true,
+    });
+  },
+};
+
+/** Persist a dead-owner projection while the caller holds run ownership. */
+export function persistReconciledProjection(
+  snapshot: RunSnapshot,
+  projection: RunProjection,
+  generation: number,
+  interruptedChildIds: readonly string[],
+  writeStatus: (path: string, contents: string) => void = reconcileProjectionWrites.writeStatus,
+): void {
+  const projectedStatus = isTerminalStatus(projection.summary.status) ? projection.summary.status : undefined;
+  const status: unknown = structuredClone(snapshot.status);
+  if (!projectedStatus || !isRecord(status)) throw new Error("run status is not reconcilable");
+  const persistedChildren = isRecord(status.children) ? status.children : {};
+  status.children = Object.fromEntries(projection.detail.children.map((child) => {
+    const persisted = persistedChildren[child.id];
+    return [child.id, {
+      status: isTerminalStatus(child.status) ? child.status : "aborted",
+      usage: isRecord(persisted) && isUsageSummary(persisted.usage) ? structuredClone(persisted.usage) : EMPTY_USAGE(),
+    }];
+  }));
+  status.status = projectedStatus;
+
+  const hasCrashEvent = snapshot.events.some((value) => {
+    return isRecord(value) && value.type === "crash_reconciled" && value.generation === generation;
+  });
+  if (!hasCrashEvent) {
+    if (snapshot.rawEvents === undefined) throw new Error("events.jsonl is not readable");
+    const separator = snapshot.rawEvents.length > 0 && !snapshot.rawEvents.endsWith("\n") ? "\n" : "";
+    const event = {
+      timestamp: new Date().toISOString(),
+      type: "crash_reconciled",
+      generation,
+      status: projectedStatus,
+      interruptedChildIds,
+    };
+    replaceAtomicFile(join(snapshot.runDir, "events.jsonl"), `${snapshot.rawEvents}${separator}${JSON.stringify(event)}\n`, {
+      mode: 0o600,
+      fsync: true,
+      syncParentDirectory: true,
+    });
+  }
+  writeStatus(join(snapshot.runDir, "status.json"), `${JSON.stringify(status, null, 2)}\n`);
 }
 
 interface ChildRecord {
@@ -51,6 +105,10 @@ interface RunRecord {
   phases?: Array<{ title: string; detail?: string }>;
   workflowPolicy?: { maxAgentsPerWorkflow: number };
   delivery?: RunDeliveryIdentity;
+  /** Results go directly to a human (navigator follow-up); catch-up must never
+   * queue them to the model. If a third delivery mode ever appears, replace
+   * this boolean with a delivery-policy value rather than adding a sibling. */
+  directDelivery?: true;
 }
 
 interface RunStatus {
@@ -64,6 +122,8 @@ interface RunStoreOptions {
   kind?: "subagent" | "workflow";
   phases?: readonly Readonly<{ title: string; detail?: string }>[];
   maxAgentsPerWorkflow?: number;
+  /** Persisted in run.json before any child starts, so a crash can never leave the run catch-up eligible. */
+  directDelivery?: boolean;
   existingRunDir?: string;
   /** Policy-neutral pre-lock read supplied by a caller that already resolved the run. */
   existingSnapshot?: RunSnapshot;
@@ -186,6 +246,7 @@ export class RunStore {
       ...(kind === "workflow" && options.maxAgentsPerWorkflow !== undefined
         ? { workflowPolicy: { maxAgentsPerWorkflow: options.maxAgentsPerWorkflow } }
         : {}),
+      ...(options.directDelivery ? { directDelivery: true as const } : {}),
     };
     this.validateWorkflowPolicy(this.record);
     // Reserve the run id before touching metadata. A repeated id must never
@@ -302,12 +363,13 @@ export class RunStore {
       }
 
       const priorIdentity = parseRunDeliveryIdentity(this.record);
+      const nextGeneration = (priorIdentity?.generation ?? 0) + 1;
       const nextRecord: RunRecord = {
         ...this.record,
         v: 3,
         delivery: {
           protocol: DELIVERY_PROTOCOL_VERSION,
-          generation: (priorIdentity?.generation ?? 0) + 1,
+          generation: nextGeneration,
         },
       };
       const reconciledPhases = reconcileResumePhases(phases, this.record.phases, this.record.children);
@@ -357,6 +419,7 @@ export class RunStore {
       const startedEvent = `${reconciliationEvents ? `${reconciliationEvents}\n` : ""}${JSON.stringify({
         timestamp: startedAt,
         type: "workflow_started",
+        generation: nextGeneration,
         ...(inputs.rerunChildIds?.length ? { rerunChildIds: [...inputs.rerunChildIds] } : {}),
       })}\n`;
 

@@ -15,8 +15,11 @@ import type { FollowUpReference, SubagentSpec, ResolvedSpec, ThinkingLevel } fro
 import type { ChildSession } from "./child-session.js";
 import type { SchemaCapture } from "./schema-tool.js";
 
+/** The slice of ExtensionContext the child spawn path actually consumes. */
+export type ParentExtensionContext = Pick<ExtensionContext, "cwd" | "sessionManager" | "modelRegistry" | "model">;
+
 export interface ParentContext {
-  ctx: ExtensionContext;
+  ctx: ParentExtensionContext;
   thinkingLevel: ThinkingLevel;
   selfPath: string;
 }
@@ -96,7 +99,7 @@ function suggestQualified(bareId: string, registry: ExtensionContext["modelRegis
   return "";
 }
 
-export function resolveModel(spec: SubagentSpec, ctx: ExtensionContext, inheritedThinking: ThinkingLevel): { model: NonNullable<ExtensionContext["model"]>; thinking: ThinkingLevel } {
+export function resolveModel(spec: SubagentSpec, ctx: Pick<ParentExtensionContext, "model" | "modelRegistry">, inheritedThinking: ThinkingLevel): { model: NonNullable<ExtensionContext["model"]>; thinking: ThinkingLevel } {
   const thinking = spec.thinkingLevel ?? inheritedThinking;
   // Only an OMITTED model inherits; an empty string is an authoring error and
   // must fail loudly like any other invalid reference.
