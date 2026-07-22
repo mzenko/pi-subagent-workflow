@@ -1,6 +1,6 @@
 {
   "name": "pi-subagent-workflow",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Ad-hoc composable subagents and Claude Code-style dynamic workflow orchestration for pi. No personas, no registries - workers composed on the fly.",
   "type": "module",
   "main": "./dist/index.js",
@@ -43,6 +43,12 @@
   },
   "author": "Matt Zenko",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mzenko/pi-subagent-workflow.git"
+  },
+  "homepage": "https://github.com/mzenko/pi-subagent-workflow#readme",
+  "bugs": "https://github.com/mzenko/pi-subagent-workflow/issues",
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": ">=0.80.6",

@@ -1,5 +1,7 @@
 # pi-subagent-workflow
 
+[![npm version](https://img.shields.io/npm/v/pi-subagent-workflow)](https://www.npmjs.com/package/pi-subagent-workflow)
+
 Ad-hoc subagents and scripted workflow orchestration for [pi](https://github.com/earendil-works/pi).
 
 No personas, no registries. A **subagent** is a per-call spec (prompt, model, tools) run as its own pi process. A **workflow** is deterministic JavaScript that composes those same subagents into phases, pipelines, and fan-outs, with a journal that makes runs resumable. Recurring shapes (adversarial verification, judge panels, loop-until-dry) live as [patterns](docs/patterns.md), not built-in agent types.
@@ -9,6 +11,8 @@ Requires pi `>= 0.80.6`. No native dependencies.
 ## Install
 
 ```sh
+pi install npm:pi-subagent-workflow
+# or from GitHub:
 pi install git:github.com/mzenko/pi-subagent-workflow
 # or, for local development:
 pi install /path/to/pi-subagent-workflow
