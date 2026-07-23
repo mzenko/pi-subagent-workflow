@@ -1,5 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { existsSync } from "node:fs";
 import { performance } from "node:perf_hooks";
+import { fileURLToPath } from "node:url";
 import { isMainThread, parentPort, Worker, workerData } from "node:worker_threads";
 import { errorMessage } from "../util.ts";
 // Explicit .ts specifier: this module is a worker entry (new Worker(import.meta.url))
@@ -34,6 +36,28 @@ export interface WorkflowVmApi {
 
 const DEFAULT_SYNCHRONOUS_TIMEOUT_MS = 30_000;
 const WORKER_MARKER = "pi-subagent-workflow-vm-v1";
+
+/**
+ * Resolve the worker entry for this module.
+ *
+ * The host runs under jiti, which transpiles .ts imports in-process, but a
+ * worker_threads entry is loaded by Node's native loader, which refuses to
+ * type-strip files under node_modules (ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING).
+ * For npm installs the package always ships a fresh compiled worker, so redirect
+ * to it. Outside node_modules (dev checkouts, path installs) keep the source
+ * entry: dist/ may be stale there, and native type stripping is permitted.
+ */
+export function resolveWorkerEntryUrl(moduleUrl: string, exists: (path: string) => boolean = existsSync): URL {
+  const url = new URL(moduleUrl);
+  if (url.protocol === "file:" && url.pathname.endsWith("/src/workflow/vm.ts") && url.pathname.includes("/node_modules/")) {
+    const compiled = new URL(url.href);
+    compiled.pathname = url.pathname.replace(/\/src\/workflow\/vm\.ts$/, "/dist/src/workflow/vm.js");
+    compiled.search = "";
+    compiled.hash = "";
+    if (exists(fileURLToPath(compiled))) return compiled;
+  }
+  return url;
+}
 
 interface WorkflowWorkerData extends WorkflowSandboxInput {
   marker: typeof WORKER_MARKER;
@@ -105,7 +129,7 @@ export async function executeWorkflowBody(
   };
 
   return new Promise<unknown>((resolve, reject) => {
-    const worker = new Worker(new URL(import.meta.url), {
+    const worker = new Worker(resolveWorkerEntryUrl(import.meta.url), {
       workerData: data,
       resourceLimits: {
         maxOldGenerationSizeMb: 128,

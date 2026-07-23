@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { executeWorkflowBody } from "../src/workflow/vm.js";
+import { executeWorkflowBody, resolveWorkerEntryUrl } from "../src/workflow/vm.js";
 
 const api = { agent: async () => null, phase: () => {}, log: () => {}, args: { nested: { value: 1 } } };
 const DATE_CONSTRUCTION_ERROR = "Date construction requires exactly one primitive finite number of epoch milliseconds. Workflow determinism requires this value to come through args for timestamps or randomness. Pass epoch milliseconds via args or use Date.UTC";
@@ -794,4 +794,23 @@ test("workflow VM worker entry loads under plain Node", async () => {
     await proc.exited;
     await Bun.file(entryPath).unlink();
   }
+});
+
+test("worker entry stays on source outside node_modules", () => {
+  const source = "file:///home/dev/pi-subagent-workflow/src/workflow/vm.ts";
+  expect(resolveWorkerEntryUrl(source, () => true).href).toBe(source);
+});
+
+test("worker entry redirects to compiled JS under node_modules", () => {
+  const source = "file:///app/node_modules/pi-subagent-workflow/src/workflow/vm.ts";
+  expect(resolveWorkerEntryUrl(source, () => true).href).toBe(
+    "file:///app/node_modules/pi-subagent-workflow/dist/src/workflow/vm.js",
+  );
+});
+
+test("worker entry keeps source when compiled worker is missing or module is already JS", () => {
+  const tsSource = "file:///app/node_modules/pi-subagent-workflow/src/workflow/vm.ts";
+  expect(resolveWorkerEntryUrl(tsSource, () => false).href).toBe(tsSource);
+  const jsSource = "file:///app/node_modules/pi-subagent-workflow/dist/src/workflow/vm.js";
+  expect(resolveWorkerEntryUrl(jsSource, () => true).href).toBe(jsSource);
 });
