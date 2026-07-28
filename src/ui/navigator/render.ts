@@ -9,14 +9,16 @@
  */
 
 import { truncateToWidth } from "@earendil-works/pi-tui";
-import { clamp, countStatuses, formatDuration, formatTokens, statusGlyph, type ThemeLike } from "../format.js";
+import { clamp, countStatuses, formatDuration, formatTokens, modelEffort, padStart, statusGlyph, type ThemeLike } from "../format.js";
 import { sanitizeTerminalText } from "../sanitize.js";
 import type { FilterMode } from "./controls.js";
 import { orderedChildren } from "./controls.js";
 import type { ChildRow, RunDetail, RunSummary } from "./store-read.js";
 
 const LABEL_MAX = 30;
-const MODEL_MAX = 16;
+const MODEL_MAX = 22;
+const ELAPSED_WIDTH = 6;
+const TOKENS_WIDTH = 10;
 
 /** Compact relative age: "12s", "5m", "3h", "2d". */
 function formatAge(ms: number): string {
@@ -264,10 +266,13 @@ function renderChildRow(child: ChildRow, selected: boolean, theme: ThemeLike, no
   const label = truncateToWidth(sanitizeTerminalText(child.label), LABEL_MAX, "…", true);
   const styledLabel = selected ? theme.fg("accent", theme.bold(label)) : label;
   const cells = [`${selector(selected)}${glyph} ${styledLabel}`];
-  if (child.model) cells.push(theme.fg("dim", truncateToWidth(sanitizeTerminalText(child.model), MODEL_MAX, "…", true)));
+  // modelEffort already fits MODEL_MAX; truncateToWidth pads it to a fixed column.
+  if (child.model) cells.push(theme.fg("dim", truncateToWidth(sanitizeTerminalText(modelEffort(child.model, child.thinking, MODEL_MAX)), MODEL_MAX, "…", true)));
+  // Elapsed and tokens are right-aligned in fixed columns so the trailing
+  // activity/result text starts at the same column on every row.
   const elapsed = child.startedAt !== undefined ? formatDuration((child.endedAt ?? now) - child.startedAt) : "";
-  if (elapsed) cells.push(theme.fg("dim", elapsed));
-  cells.push(theme.fg("dim", `${formatTokens(child.tokens)} tok`));
+  if (elapsed) cells.push(theme.fg("dim", padStart(elapsed, ELAPSED_WIDTH)));
+  cells.push(theme.fg("dim", padStart(`${formatTokens(child.tokens)} tok`, TOKENS_WIDTH)));
   const trailing = child.error
     ? theme.fg("error", sanitizeTerminalText(child.error))
     : theme.fg("dim", sanitizeTerminalText(child.status === "running" ? child.activity ?? "" : child.resultLine ?? ""));

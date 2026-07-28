@@ -6,6 +6,7 @@ import {
   formatDuration,
   formatTokens,
   PLAIN,
+  modelEffort,
   shortModel,
   SPINNER,
   spinnerFrame,
@@ -76,4 +77,17 @@ test("countStatuses aggregates buckets and activity", () => {
   expect(counts.done).toBe(4);
   expect(counts.active).toBe(true);
   expect(countStatuses(["completed", "failed"]).active).toBe(false);
+});
+
+test("modelEffort binds effort to the model and protects it from truncation", () => {
+  expect(modelEffort("gpt-5.6-sol", "high", 24)).toBe("gpt-5.6-sol·high");
+  // A model long enough to fill the cell loses characters; the effort survives.
+  expect(modelEffort("claude-opus-4-5-20251101", "xhigh", 20)).toBe("claude-opus-4…·xhigh");
+  expect(modelEffort("claude-opus-4-5-20251101", "xhigh", 20).length).toBeLessThanOrEqual(20);
+});
+
+test("modelEffort omits the resting state and handles a missing model", () => {
+  expect(modelEffort("gpt-5.6-sol", "off", 24)).toBe("gpt-5.6-sol");
+  expect(modelEffort("gpt-5.6-sol", undefined, 24)).toBe("gpt-5.6-sol");
+  expect(modelEffort("", "high", 24)).toBe("");
 });

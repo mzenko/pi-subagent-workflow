@@ -525,7 +525,7 @@ export function buildAgentView(
   };
   const header = () => {
     const row = child();
-    return { label: row?.label ?? childId, model: row?.model ?? "", status: row?.status ?? "pending", tokens: row?.tokens ?? 0 };
+    return { label: row?.label ?? childId, model: row?.model ?? "", thinking: row?.thinking, status: row?.status ?? "pending", tokens: row?.tokens ?? 0 };
   };
 
   // A queued or constructing child has a durable row before it has a session.

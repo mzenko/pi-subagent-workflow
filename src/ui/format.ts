@@ -83,6 +83,31 @@ export function shortModel(modelId: string | undefined): string {
   return slash >= 0 ? modelId.slice(slash + 1) : modelId;
 }
 
+/**
+ * Model and reasoning effort as one cell: "gpt-5.6-sol·high".
+ *
+ * Binding them into a single cell keeps the effort visually attached to the
+ * model it applies to, and costs less width than a separate aligned column.
+ * Effort is appended after the model is truncated so a long model id can never
+ * push it out of view - the effort is the shorter and rarer piece of
+ * information, so it is the one worth protecting.
+ *
+ * "off" renders as bare model: it is the resting state for every non-reasoning
+ * model, so showing it would add a column of noise to the common case without
+ * telling the reader anything the model name does not already imply.
+ */
+export function modelEffort(model: string, thinking: string | undefined, max: number): string {
+  if (!model) return "";
+  if (!thinking || thinking === "off") return truncate(model, max);
+  const suffix = `·${thinking}`;
+  return `${truncate(model, Math.max(1, max - suffix.length))}${suffix}`;
+}
+
+/** Width-truncate a plain (ANSI-free) string with an ellipsis. */
+function truncate(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`;
+}
+
 /** First non-empty line of result text, collapsed and trimmed. */
 export function firstLine(text: string): string {
   return text.split("\n").map((line) => line.trim()).find((line) => line.length > 0) ?? "";

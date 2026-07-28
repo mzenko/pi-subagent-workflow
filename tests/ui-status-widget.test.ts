@@ -170,7 +170,20 @@ test("a workflow row shows its name, current phase position, and progress", () =
   expect(lines[1]).toContain("country-atlas");
   expect(lines[1]).toContain("Research (2/3)");
   expect(lines[1]).toContain("3/5");
-  expect(lines[1]).toContain("2m10s");
+  expect(lines[1]).toContain("45.2k tok");
+});
+
+test("widget content is clock-independent so idle runs never force a repaint", () => {
+  // Pi draws inline, so every repaint snaps the terminal viewport to the bottom.
+  // Anything clock-derived here (spinner frame, elapsed) would change the painted
+  // text on its own schedule and make the scrollback unusable for the whole life
+  // of a background run. Same state at two very different clocks must render
+  // byte-identically.
+  const runs = [view({
+    kind: "workflow", label: "country-atlas", phase: "Research (2/3)",
+    counts: countStatuses(["running", "completed"]), tokens: 45_200, startedAt: 0,
+  })];
+  expect(renderWidgetLines(runs, PLAIN, 120, 1_000)).toEqual(renderWidgetLines(runs, PLAIN, 120, 9_999_000));
 });
 
 test("a just-started workflow with no children yet renders as starting", () => {

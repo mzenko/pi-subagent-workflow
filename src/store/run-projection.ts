@@ -35,6 +35,8 @@ export interface ChildRow {
   id: string;
   label: string;
   model: string;
+  /** Reasoning effort the child resolved to, shown beside the model. */
+  thinking?: string;
   phase?: string;
   status: SubagentStatus;
   tokens: number;
@@ -176,6 +178,7 @@ export function projectRunSnapshot(snapshot: RunSnapshot, runId: string, options
       id: state.id,
       label: persistedChildLabel(child, state.id || "agent"),
       model: shortModel(optionalString(child.resolved?.modelId)),
+      thinking: optionalString(child.resolved?.thinkingLevel),
       phase: optionalString(child.phase) ?? optionalString(child.spec?.phase),
       status: state.status,
       tokens: state.tokens,
@@ -341,6 +344,7 @@ export function foldRunProjection(projection: RunProjection, event: RunProjectio
     const child = projection.detail.children.find((item) => item.id === event.id);
     if (!child) return;
     child.model = shortModel(event.resolved.modelId);
+    child.thinking = event.resolved.thinkingLevel;
     child.sessionFile = event.sessionFile;
     foldActivity(projection.activity, { type: "child", id: event.id, label: event.resolved.label });
     return;
@@ -398,6 +402,7 @@ export function foldRunProjection(projection: RunProjection, event: RunProjectio
     child.error = event.result.error;
     child.sessionFile = event.result.sessionFile ?? child.sessionFile;
     child.model = shortModel(event.result.resolved.modelId);
+    child.thinking = event.result.resolved.thinkingLevel;
   }
   refreshProjection(projection);
 }

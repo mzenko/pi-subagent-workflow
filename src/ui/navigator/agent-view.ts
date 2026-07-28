@@ -10,16 +10,20 @@
 
 import { Input, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
 import type { SubagentStatus } from "../../types.js";
-import { formatTokens, PLAIN, statusGlyph, type ThemeLike } from "../format.js";
+import { formatTokens, modelEffort, PLAIN, statusGlyph, type ThemeLike } from "../format.js";
 import { sanitizeTerminalText } from "../sanitize.js";
 import { messagesToLines, type TranscriptMessage } from "./transcript.js";
 
 interface AgentHeader {
   label: string;
   model: string;
+  /** Reasoning effort the child resolved to, shown beside the model. */
+  thinking?: string;
   status: SubagentStatus;
   tokens: number;
 }
+
+const MODEL_MAX = 28;
 
 type ComposerKind = "steer" | "message";
 
@@ -225,7 +229,8 @@ export class AgentView {
     const head = this.deps.header();
     const glyph = statusGlyph(head.status, theme, Date.now(), head.status === "running");
     const label = sanitizeTerminalText(head.label);
-    const model = sanitizeTerminalText(head.model || "?");
+    // The tight "·" binds effort to its model; the spaced " · " separates fields.
+    const model = sanitizeTerminalText(head.model ? modelEffort(head.model, head.thinking, MODEL_MAX) : "?");
     const title = `${glyph} ${theme.bold(label)} ${theme.fg("dim", `· ${model} · ${head.status} · ${formatTokens(head.tokens)} tok`)}`;
     const lines: string[] = [truncateToWidth(title, cap), truncateToWidth(theme.fg("dim", "─".repeat(cap)), cap)];
 

@@ -96,3 +96,31 @@ test("renderRows never exceeds the terminal width", () => {
     expect(visibleWidth(line)).toBeLessThanOrEqual(40);
   }
 });
+
+test("renderRows shows reasoning effort beside the model and aligns the trailing column", () => {
+  const details: SubagentDetails = {
+    fanout: true,
+    children: [
+      { id: "c1", label: "audit", modelId: "gpt-5.6-sol", thinking: "high", status: "running", tokens: 12_400, startedAt: 0, activity: "grepping" },
+      // "off" is the resting state for non-reasoning models and stays hidden.
+      { id: "c2", label: "lint", modelId: "haiku-4-5", thinking: "off", status: "completed", tokens: 800, startedAt: 0, endedAt: 1_000, resultLine: "clean" },
+    ],
+  };
+  const [, first, second] = renderRows(details, PLAIN, 200, 3_400, false);
+  expect(first).toContain("gpt-5.6-sol·high");
+  expect(second).toContain("haiku-4-5");
+  expect(second).not.toContain("off");
+  // The trailing free-text field starts at the same column on both rows even
+  // though one child crossed 10k tokens and the other did not.
+  expect(first!.indexOf("grepping")).toBe(second!.indexOf("clean"));
+});
+
+test("renderRows keeps effort visible when the model id fills the cell", () => {
+  const details: SubagentDetails = {
+    fanout: false,
+    children: [{ id: "c1", label: "verify", modelId: "claude-opus-4-5-20251101", thinking: "xhigh", status: "running", tokens: 0, startedAt: 0 }],
+  };
+  const [row] = renderRows(details, PLAIN, 200, 1_000, false);
+  expect(row).toContain("·xhigh");
+  expect(row).toContain("…");
+});

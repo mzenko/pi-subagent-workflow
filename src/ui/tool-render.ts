@@ -17,6 +17,7 @@ import {
   firstLine,
   formatDuration,
   formatTokens,
+  modelEffort,
   padStart,
   shortModel,
   statusGlyph,
@@ -29,6 +30,8 @@ interface ChildSnapshot {
   id: string;
   label: string;
   modelId: string;
+  /** Reasoning effort the child resolved to, shown beside the model. */
+  thinking?: string;
   status: SubagentStatus;
   tokens: number;
   startedAt: number;
@@ -46,9 +49,11 @@ export interface SubagentDetails {
 
 const LABEL_MIN = 6;
 const LABEL_MAX = 28;
-const MODEL_MAX = 18;
+const MODEL_MAX = 24;
 const ELAPSED_WIDTH = 6;
-const TOKENS_WIDTH = 8;
+/** Wide enough for the longest formatTokens output ("123.4k tok"), so the
+ * trailing field still starts at the same column once a child passes 10k. */
+const TOKENS_WIDTH = 10;
 const GAP = "  ";
 /** Rows shown before a collapsed (not expanded) fan-out folds into a count. */
 const COLLAPSED_ROWS = 8;
@@ -96,6 +101,7 @@ export class SubagentRowTracker {
         id: handle.id,
         label: sanitizeTerminalText(childLabel(handle.spec)),
         modelId: sanitizeTerminalText(shortModel(handle.resolved?.modelId)),
+        thinking: handle.resolved?.thinkingLevel,
         status: handle.status,
         tokens: this.tokens.get(handle.id) ?? 0,
         startedAt: handle.startedAt,
@@ -127,8 +133,10 @@ export function renderRows(details: SubagentDetails, theme: ThemeLike, width: nu
   const collapsed = !expanded && all.length > COLLAPSED_ROWS;
   const children = collapsed ? all.slice(0, COLLAPSED_ROWS) : all;
   const labelWidth = clamp(Math.max(...children.map((child) => child.label.length), LABEL_MIN), LABEL_MIN, LABEL_MAX);
-  const hasModel = children.some((child) => child.modelId.length > 0);
-  const modelWidth = hasModel ? clamp(Math.max(...children.map((child) => child.modelId.length)), 1, MODEL_MAX) : 0;
+  // Model and effort share one cell, so alignment is computed on the combined
+  // text rather than the model id alone.
+  const modelCells = new Map(children.map((child) => [child.id, modelEffort(child.modelId, child.thinking, MODEL_MAX)]));
+  const modelWidth = clamp(Math.max(0, ...[...modelCells.values()].map((cell) => cell.length)), 0, MODEL_MAX);
 
   const lines: string[] = [];
   if (details.fanout) lines.push(truncateToWidth(renderHeader(details, theme, now, animate), cap));
@@ -140,7 +148,7 @@ export function renderRows(details: SubagentDetails, theme: ThemeLike, width: nu
     const elapsed = theme.fg("dim", padStart(formatDuration(elapsedMs), ELAPSED_WIDTH));
     const tokens = theme.fg("dim", padStart(`${formatTokens(child.tokens)} tok`, TOKENS_WIDTH));
     const cells = [`${glyph} ${label}`];
-    if (modelWidth > 0) cells.push(theme.fg("dim", truncateToWidth(sanitizeTerminalText(child.modelId), modelWidth, "…", true)));
+    if (modelWidth > 0) cells.push(theme.fg("dim", truncateToWidth(sanitizeTerminalText(modelCells.get(child.id) ?? ""), modelWidth, "…", true)));
     cells.push(elapsed, tokens);
     const rest = trailing(child, theme);
     const head = cells.join(GAP);
@@ -234,6 +242,7 @@ export function initialDetails(specs: SubagentSpec[], handles: readonly Subagent
       id: handle.id,
       label: sanitizeTerminalText(childLabel(specs[index] ?? handle.spec)),
       modelId: sanitizeTerminalText(shortModel(handle.resolved?.modelId)),
+      thinking: handle.resolved?.thinkingLevel,
       status: handle.status,
       tokens: 0,
       startedAt: handle.startedAt,
