@@ -36,6 +36,14 @@ export interface ReadOptions {
   readSnapshot?: (runDir: string) => RunSnapshot;
   listRunIds?: (runsDir: string) => string[];
   ownerIsLive?: (runDir: string) => boolean;
+  /**
+   * Cache-key stat seam. The invalidation contract is "any change to mtime,
+   * ctime, or size is a change", and a test cannot vary those one at a time on a
+   * real filesystem: tmpfs derives ctime from the kernel's coarse clock, whose
+   * granularity is one jiffy (4ms at CONFIG_HZ=250), so two writes inside a tick
+   * are indistinguishable no matter how the test sleeps.
+   */
+  statFile?: (path: string) => { mtimeNs: bigint; ctimeNs: bigint; size: bigint } | undefined;
   /** In-memory projection seam; defaults to the process-wide runner. */
   ownedProjection?: (runId: string) => RunProjection | undefined;
   /** Selected non-owned runs bypass the mtime cache to preserve fresh detail. */
@@ -172,7 +180,7 @@ function readDiskSummary(
   protectedCacheKeys?: ReadonlySet<string>,
 ): RunSummary {
   const cacheKey = resolve(runDir);
-  const signatures = relevantFileSignatures(cacheKey);
+  const signatures = relevantFileSignatures(cacheKey, opts);
   const entry = matchingDiskRun(cacheKey, runId, opts);
   if (!opts.bypassCache && entry && sameFileSignatures(entry.signatures, signatures)) {
     reprobeOwner(entry, runDir, opts);
@@ -198,7 +206,7 @@ function readDiskSummary(
 
 function readDiskProjection(runDir: string, runId: string, opts: ReadOptions): RunProjection {
   const cacheKey = resolve(runDir);
-  const signatures = relevantFileSignatures(cacheKey);
+  const signatures = relevantFileSignatures(cacheKey, opts);
   const entry = matchingDiskRun(cacheKey, runId, opts);
   if (!opts.bypassCache && entry && sameFileSignatures(entry.signatures, signatures)) {
     reprobeOwner(entry, runDir, opts);
@@ -307,23 +315,30 @@ function projectionForCaller(projection: RunProjection, runDir: string): RunProj
   return cloned;
 }
 
-function relevantFileSignatures(runDir: string): RelevantFileSignatures {
+function relevantFileSignatures(runDir: string, opts: ReadOptions): RelevantFileSignatures {
+  const stat = opts.statFile ?? defaultStatFile;
   return {
-    run: fileSignature(join(runDir, "run.json")),
-    status: fileSignature(join(runDir, "status.json")),
-    events: fileSignature(join(runDir, "events.jsonl")),
-    script: fileSignature(join(runDir, "script.js")),
-    generationPending: fileSignature(join(runDir, "generation.pending")),
+    run: fileSignature(join(runDir, "run.json"), stat),
+    status: fileSignature(join(runDir, "status.json"), stat),
+    events: fileSignature(join(runDir, "events.jsonl"), stat),
+    script: fileSignature(join(runDir, "script.js"), stat),
+    generationPending: fileSignature(join(runDir, "generation.pending"), stat),
   };
 }
 
-function fileSignature(path: string): string {
+type StatFile = NonNullable<ReadOptions["statFile"]>;
+
+function defaultStatFile(path: string): ReturnType<StatFile> {
   try {
-    const stat = statSync(path, { bigint: true });
-    return `${stat.mtimeNs}:${stat.ctimeNs}:${stat.size}`;
+    return statSync(path, { bigint: true });
   } catch {
-    return "missing";
+    return undefined;
   }
+}
+
+function fileSignature(path: string, stat: StatFile): string {
+  const value = stat(path);
+  return value === undefined ? "missing" : `${value.mtimeNs}:${value.ctimeNs}:${value.size}`;
 }
 
 function sameFileSignatures(left: RelevantFileSignatures, right: RelevantFileSignatures): boolean {

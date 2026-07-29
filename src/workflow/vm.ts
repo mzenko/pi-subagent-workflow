@@ -49,14 +49,27 @@ const WORKER_MARKER = "pi-subagent-workflow-vm-v1";
  */
 export function resolveWorkerEntryUrl(moduleUrl: string, exists: (path: string) => boolean = existsSync): URL {
   const url = new URL(moduleUrl);
-  if (url.protocol === "file:" && url.pathname.endsWith("/src/workflow/vm.ts") && url.pathname.includes("/node_modules/")) {
-    const compiled = new URL(url.href);
-    compiled.pathname = url.pathname.replace(/\/src\/workflow\/vm\.ts$/, "/dist/src/workflow/vm.js");
-    compiled.search = "";
-    compiled.hash = "";
-    if (exists(fileURLToPath(compiled))) return compiled;
+  const installedSource = url.protocol === "file:"
+    && url.pathname.endsWith("/src/workflow/vm.ts")
+    && url.pathname.includes("/node_modules/");
+  if (!installedSource) return url;
+
+  const compiled = new URL(url.href);
+  compiled.pathname = url.pathname.replace(/\/src\/workflow\/vm\.ts$/, "/dist/src/workflow/vm.js");
+  compiled.search = "";
+  compiled.hash = "";
+  // Under node_modules the compiled worker is the only entry that can work, so a
+  // missing one is fatal rather than a reason to fall back. Falling back here used
+  // to re-create the exact bug this redirect exists to prevent, and reported it as
+  // an opaque ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING from deep inside Node.
+  if (!exists(fileURLToPath(compiled))) {
+    throw new Error(
+      `Workflow worker is missing from the installed package: ${fileURLToPath(compiled)}. `
+      + "Node cannot strip types from .ts files under node_modules, so the compiled worker must ship. "
+      + "Reinstall pi-subagent-workflow.",
+    );
   }
-  return url;
+  return compiled;
 }
 
 interface WorkflowWorkerData extends WorkflowSandboxInput {

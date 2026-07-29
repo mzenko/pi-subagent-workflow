@@ -8,7 +8,7 @@ import { parseModel, resolveModel } from "../src/runner/child.js";
 import { encodeCwd, RunStore } from "../src/store/run-store.js";
 import { hasSessionClosedMarker, writeSessionClosedMarker } from "../src/store/session-closed-marker.js";
 import { readRunSnapshot } from "../src/store/run-snapshot.js";
-import { resolveFollowUpSpec, SubagentToolParameters, validateSubagentInput } from "../src/tool/subagent-tool.js";
+import { resolveFollowUpSpec, SubagentToolParameters, validateSubagentInput, withFollowUpLabel } from "../src/tool/subagent-tool.js";
 import type { ResolvedSpec, SubagentSpec, SubagentStatus } from "../src/types.js";
 
 
@@ -64,6 +64,28 @@ describe("subagent validation", () => {
       type: "spawn",
       specs: [{ prompt: "a", model: "p/m" }],
     });
+  });
+
+  test("a follow-up may name the new turn but not redescribe the agent", () => {
+    // A fork resumes a persisted session, so its execution configuration must come
+    // from the source child. `label` is presentation only, and a follow-up turn
+    // usually has a different purpose than the child it forks from.
+    expect(validateSubagentInput({ followUp: { id: "child", prompt: "more" }, label: "Verify claim fixes" }))
+      .toEqual({ type: "followUp", id: "child", prompt: "more", label: "Verify claim fixes" });
+    for (const field of ["model", "thinkingLevel", "tools", "excludeTools", "schema", "cwd", "isolation"] as const) {
+      const value = field === "tools" || field === "excludeTools"
+        ? ["read"]
+        : field === "schema" ? { type: "object" } : field === "isolation" ? "worktree" : field === "thinkingLevel" ? "high" : "x";
+      expect(() => validateSubagentInput({ followUp: { id: "child", prompt: "more" }, [field]: value } as never))
+        .toThrow(`With followUp, ${field} is invalid at the top level`);
+    }
+  });
+
+  test("a follow-up label overrides the inherited one, and a blank label does not", () => {
+    const resolved = { spec: { prompt: "more", model: "p/m", label: "Audit claims" }, forkSessionFile: "/s.jsonl", followUpOf: { runId: "r", childId: "c" } } as never;
+    expect(withFollowUpLabel(resolved, "Verify claim fixes").spec.label).toBe("Verify claim fixes");
+    expect(withFollowUpLabel(resolved, undefined).spec.label).toBe("Audit claims");
+    expect(withFollowUpLabel(resolved, "   ").spec.label).toBe("Audit claims");
   });
 
 });

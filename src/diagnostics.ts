@@ -15,8 +15,17 @@ import { sanitizeTerminalText } from "./ui/sanitize.js";
 const DIAGNOSTICS_LOG_CAP_BYTES = 5 * 1024 * 1024;
 let tuiSession = false;
 
-export function markTuiSession(): void {
-  tuiSession = true;
+/**
+ * Record whether a TUI owns the terminal, and so where diagnostics may go.
+ *
+ * Takes a value rather than latching one-way. A one-way latch is process-wide
+ * state that nothing can put back, which silently couples any two tests sharing
+ * this module: once one marks a session, every later test that asserts on
+ * console.error sees diagnostics go to the log file instead, and passes or fails
+ * on file ordering alone.
+ */
+export function setTuiSession(active = true): void {
+  tuiSession = active;
 }
 
 export function reportDiagnostic(message: string): void {

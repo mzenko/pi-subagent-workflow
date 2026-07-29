@@ -26,6 +26,10 @@ test("packed tarball runs a workflow when installed under node_modules", async (
     if ((await untar.exited) !== 0) throw new Error(await new Response(untar.stderr).text());
     mkdirSync(join(stage, "node_modules"));
     renameSync(join(stage, "package"), join(stage, "node_modules", "pi-subagent-workflow"));
+    // `npm pack` runs prepack, which is `rm -rf dist && tsc` in the shared repo, so
+    // this test cannot run alongside anything else that writes dist/ - including
+    // another copy of itself. If it does, the tarball is packed mid-rebuild and
+    // resolveWorkerEntryUrl reports the missing compiled worker by name.
 
     const jitiUrl = import.meta.resolve("jiti");
     const vmUrl = pathToFileURL(join(stage, "node_modules", "pi-subagent-workflow", "src", "workflow", "vm.ts")).href;

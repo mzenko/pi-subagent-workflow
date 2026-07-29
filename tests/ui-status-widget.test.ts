@@ -21,7 +21,6 @@ test("renderWidgetLines shows a header and one line per active run", () => {
     ],
     PLAIN,
     120,
-    10_000,
   );
   expect(lines[0]).toContain("agents");
   expect(lines[0]).toContain("3 running");
@@ -34,14 +33,14 @@ test("renderWidgetLines shows a header and one line per active run", () => {
 
 test("renderWidgetLines collapses overflow and clamps width", () => {
   const runs = Array.from({ length: 9 }, (_, index) => view({ label: `run ${index}` }));
-  const lines = renderWidgetLines(runs, PLAIN, 30, 1_000);
+  const lines = renderWidgetLines(runs, PLAIN, 30);
   expect(lines.some((line) => line.includes("+3 more runs"))).toBe(true);
   for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(30);
 });
 
 test("renderWidgetLines respects a terminal narrower than any minimum layout", () => {
   const runs = [view({ label: "a very long workflow name that cannot fit", phase: "long phase name", tokens: 123_456 })];
-  const lines = renderWidgetLines(runs, PLAIN, 10, 1_000);
+  const lines = renderWidgetLines(runs, PLAIN, 10);
   expect(lines.length).toBeGreaterThan(0);
   // pi-tui kills the process on any over-wide line, so 10 means 10.
   for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(10);
@@ -55,7 +54,7 @@ test("status widget row cap follows terminal height with a fixed fallback", () =
 });
 
 test("renderWidgetLines is empty when there are no runs", () => {
-  expect(renderWidgetLines([], PLAIN, 80, 0)).toEqual([]);
+  expect(renderWidgetLines([], PLAIN, 80)).toEqual([]);
 });
 
 // ---- wiring ----
@@ -164,7 +163,7 @@ test("a workflow row shows its name, current phase position, and progress", () =
       kind: "workflow", label: "country-atlas", phase: "Research (2/3)",
       counts: countStatuses(["running", "running", "completed", "completed", "completed"]), tokens: 45_200, startedAt: 0,
     })],
-    PLAIN, 120, 130_000,
+    PLAIN, 120,
   );
   expect(lines[0]).toContain("1 workflow");
   expect(lines[1]).toContain("country-atlas");
@@ -173,23 +172,93 @@ test("a workflow row shows its name, current phase position, and progress", () =
   expect(lines[1]).toContain("45.2k tok");
 });
 
-test("widget content is clock-independent so idle runs never force a repaint", () => {
-  // Pi draws inline, so every repaint snaps the terminal viewport to the bottom.
-  // Anything clock-derived here (spinner frame, elapsed) would change the painted
-  // text on its own schedule and make the scrollback unusable for the whole life
-  // of a background run. Same state at two very different clocks must render
-  // byte-identically.
-  const runs = [view({
-    kind: "workflow", label: "country-atlas", phase: "Research (2/3)",
-    counts: countStatuses(["running", "completed"]), tokens: 45_200, startedAt: 0,
-  })];
-  expect(renderWidgetLines(runs, PLAIN, 120, 1_000)).toEqual(renderWidgetLines(runs, PLAIN, 120, 9_999_000));
+test("the widget never shrinks pi's inline buffer while an overlay is mounted", () => {
+  // Dropping lines from the inline buffer under a composited overlay shifts every
+  // overlay line up, so the first changed line lands above pi-tui's previous
+  // viewport top and it falls back to a full redraw - which erases the terminal's
+  // scrollback. Measured against pi-tui: -1 is always safe, -2 erases at 31 rows
+  // or fewer, -3 at any height. Growth and no-overlay shrinks are always safe.
+  const cleared: boolean[] = [];
+  let factory: ((tui: unknown, theme: unknown) => { render: (width: number) => string[] }) | undefined;
+  const ctx = {
+    hasUI: true,
+    ui: {
+      setWidget: (_key: string, content: unknown) => {
+        if (typeof content === "function") factory = content as typeof factory;
+        else cleared.push(true);
+      },
+      setStatus: () => {},
+    },
+  } as never;
+
+  const listeners: Array<(event: SubagentEvent) => void> = [];
+  const child = fakeHandle("c1", listeners);
+  const widget = new SubagentStatusWidget();
+  widget.track("run-1", [child.handle], false, ctx);
+
+  let overlayOpen = true;
+  const tui = { hasOverlay: () => overlayOpen, requestRender: () => {}, terminal: { rows: 24 } };
+  const mounted = factory!(tui, PLAIN);
+  const active = mounted.render(120);
+  expect(active.length).toBeGreaterThan(1);
+
+  // The last child settles while /agents is open: the rows empty out, but the
+  // painted height has to hold, and the widget must not unregister either -
+  // that removes the same lines while bypassing the guard entirely.
+  child.setStatus("completed");
+  for (const listener of listeners) listener({ type: "status", id: "c1", status: "completed" } as SubagentEvent);
+  expect(cleared).toEqual([]);
+  expect(mounted.render(120).length).toBe(active.length);
+
+  // Once the overlay closes, the real shrink happens on pi-tui's safe path.
+  overlayOpen = false;
+  expect(mounted.render(120)).toEqual([]);
+  widget.dispose();
+});
+
+test("a repaint is skipped only when the painted text is genuinely identical", () => {
+  // The repaint gate compares an encoded identity of the view, so it must not
+  // collapse two different views into one signature - a run label is arbitrary
+  // text, so any delimiter-joined scheme risks exactly that.
+  const calls: string[] = [];
+  const ctx = {
+    hasUI: true,
+    ui: {
+      setWidget: () => {},
+      setStatus: (_key: string, text: unknown) => calls.push(String(text)),
+    },
+  } as never;
+  const tui = { hasOverlay: () => false, requestRender: () => {}, terminal: { rows: 40 } };
+
+  const renderFor = (label: string, phase: string): string => {
+    const widget = new SubagentStatusWidget();
+    let factory: ((tui: unknown, theme: unknown) => { render: (width: number) => string[] }) | undefined;
+    const capture = {
+      hasUI: true,
+      ui: {
+        setWidget: (_key: string, content: unknown) => { if (typeof content === "function") factory = content as typeof factory; },
+        setStatus: () => {},
+      },
+    } as never;
+    const listeners: Array<(event: SubagentEvent) => void> = [];
+    const child = fakeHandle("c1", listeners);
+    (child.handle.spec as { label?: string }).label = label;
+    (child.handle.spec as { phase?: string }).phase = phase;
+    widget.track("run-1", [child.handle], false, capture);
+    const lines = factory!(tui, PLAIN).render(120).join("\n");
+    widget.dispose();
+    return lines;
+  };
+
+  // Two labels that a naive separator scheme could merge must render differently.
+  expect(renderFor("build docs", "")).not.toBe(renderFor("build", "docs"));
+  expect(calls.length).toBe(0);
 });
 
 test("a just-started workflow with no children yet renders as starting", () => {
   const lines = renderWidgetLines(
     [view({ kind: "workflow", label: "atlas", counts: countStatuses([]), startedAt: 0 })],
-    PLAIN, 120, 1_000,
+    PLAIN, 120,
   );
   expect(lines[1]).toContain("starting");
 });

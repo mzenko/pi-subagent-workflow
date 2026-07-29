@@ -42,29 +42,41 @@ export function appendEntrySafely(pi: ExtensionAPI, type: string, data: unknown)
   }
 }
 
+/**
+ * Entry data comes straight off the session JSONL, so it is the least trusted
+ * input any renderer here sees: a truncated write, or an entry appended by a
+ * different version of this extension, arrives with whatever shape it has. A
+ * throw would land in pi's render loop and kill the TUI on every resume, so the
+ * arrays are checked rather than assumed.
+ */
+function textList(value: unknown): string[] | undefined {
+  return Array.isArray(value) ? value.map((item) => sanitizeTerminalText(typeof item === "string" ? item : String(item))) : undefined;
+}
+
 export function renderRunStarted(data: RunStartedData, theme: ThemeLike, width: number): string[] {
   const cap = Math.max(20, width);
-  if (!data.labels) {
+  const labelList = textList(data.labels);
+  if (!labelList) {
     // Phase titles are workflow-authored; sanitize before they hit the terminal.
-    const phases = (data.phases ?? []).map((phase) => sanitizeTerminalText(phase.title)).join(" → ");
+    const phases = (Array.isArray(data.phases) ? data.phases : [])
+      .map((phase) => sanitizeTerminalText(phase?.title ?? "")).join(" → ");
     const text = `▸ workflow run ${data.runId} started${phases ? `: ${phases}` : ""}`;
     return [truncateToWidth(theme.fg("dim", text), cap)];
   }
-  const count = data.labels.length;
-  const labels = data.labels.map((label) => sanitizeTerminalText(label)).join(", ");
-  const text = `▸ subagent run ${data.runId} started · ${count} agent${count === 1 ? "" : "s"}: ${labels}`;
+  const count = labelList.length;
+  const text = `▸ subagent run ${data.runId} started · ${count} agent${count === 1 ? "" : "s"}: ${labelList.join(", ")}`;
   return [truncateToWidth(theme.fg("dim", text), cap)];
 }
 
 export function renderRunCompleted(data: RunCompletedData, theme: ThemeLike, width: number): string[] {
   const cap = Math.max(20, width);
-  if (!data.perChild || !data.usageTotals) {
+  if (!Array.isArray(data.perChild) || !data.usageTotals) {
     const marker = theme.fg("success", "●");
     const text = `${marker} ${theme.bold("workflow")} ${data.runId} ${theme.fg("dim", "· completed")}`;
     return [truncateToWidth(text, cap)];
   }
-  const counts = countStatuses(data.perChild.map((child) => child.status));
-  const tokens = formatTokens(data.usageTotals.input + data.usageTotals.output);
+  const counts = countStatuses(data.perChild.map((child) => child?.status));
+  const tokens = formatTokens((data.usageTotals.input ?? 0) + (data.usageTotals.output ?? 0));
   const marker = theme.fg(counts.failed > 0 ? "error" : counts.aborted > 0 ? "warning" : "success", "●");
   const summary =
     `${marker} ${theme.bold("subagent")} ${data.runId} ${theme.fg("dim", "·")} ` +
@@ -74,7 +86,7 @@ export function renderRunCompleted(data: RunCompletedData, theme: ThemeLike, wid
     ` ${theme.fg("dim", "·")} ${theme.fg("dim", `${tokens} tok`)} ${theme.fg("dim", "·")} ${theme.fg("dim", formatDuration(data.durationMs ?? 0))}`;
 
   const glyphs = data.perChild
-    .map((child) => `${statusGlyph(child.status, theme, 0, false)} ${sanitizeTerminalText(child.label)}`)
+    .map((child) => `${statusGlyph(child?.status, theme, 0, false)} ${sanitizeTerminalText(child?.label ?? "")}`)
     .join(theme.fg("dim", "   "));
   return [truncateToWidth(summary, cap), truncateToWidth(`  ${glyphs}`, cap)];
 }
@@ -83,10 +95,10 @@ export function renderRunCompleted(data: RunCompletedData, theme: ThemeLike, wid
 export function registerEntryMarkers(pi: ExtensionAPI): void {
   pi.registerEntryRenderer<RunStartedData>("subagent-workflow:run-started", (entry, _options, theme: Theme) => {
     if (!entry.data) return undefined;
-    return linesComponent((width) => renderRunStarted(entry.data as RunStartedData, theme, width));
+    return linesComponent((width) => renderRunStarted(entry.data as RunStartedData, theme, width), "run-started marker");
   });
   pi.registerEntryRenderer<RunCompletedData>("subagent-workflow:run-completed", (entry, _options, theme: Theme) => {
     if (!entry.data) return undefined;
-    return linesComponent((width) => renderRunCompleted(entry.data as RunCompletedData, theme, width));
+    return linesComponent((width) => renderRunCompleted(entry.data as RunCompletedData, theme, width), "run-completed marker");
   });
 }

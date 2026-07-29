@@ -31,7 +31,7 @@ import { FOLLOW_UP_PROMPT_PREFIX } from "../src/ui/navigator/transcript.js";
 import { SubagentStatusWidget } from "../src/ui/status-widget.js";
 import { safeDeliveryValue } from "../src/ui/delivery-safe.js";
 import { SubagentUsageFooter } from "../src/ui/usage-footer.js";
-import { markTuiSession, reportDiagnostic } from "../src/diagnostics.js";
+import { reportDiagnostic, setTuiSession } from "../src/diagnostics.js";
 import type { SubagentResult, ThinkingLevel } from "../src/types.js";
 import { childLabel, errorMessage } from "../src/util.js";
 import { approveLaunch } from "../src/workflow/approval.js";
@@ -397,7 +397,7 @@ export default function subagentWorkflow(pi: ExtensionAPI): void {
   pi.on("session_start", (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
     markSessionOpen(sessionId);
-    if (ctx.hasUI) markTuiSession();
+    if (ctx.hasUI) setTuiSession();
     usageFooter.attach(ctx);
     try {
       catchUpUndeliveredRuns(pi, ctx);

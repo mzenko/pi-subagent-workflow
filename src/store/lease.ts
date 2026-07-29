@@ -87,10 +87,29 @@ export function acquireRunOwnership(runDir: string): RunOwnership {
   }
 }
 
-/** Whether a process currently holds this run's SQLite ownership transaction. */
+/**
+ * Whether a live process currently holds this run's SQLite ownership transaction.
+ *
+ * Deliberately total. The probe races anything that removes a run directory - a
+ * user pruning runs, another pi process cleaning up, the run's own teardown - and
+ * the existsSync guard cannot close that window, because the file can vanish
+ * between the check and the open. That surfaces as SQLITE_CANTOPEN ("unable to
+ * open database file"), and probeSqliteLock only maps *busy* errors, so it used
+ * to propagate. Readers include the /agents disk projection, where a throw
+ * reaches a render path.
+ *
+ * A run whose owner database cannot be opened has nobody holding its writer
+ * slot, which is the same answer as a run with no owner database at all. The
+ * existsSync check stays as a fast path: acquiring creates the file, so probing
+ * a run that never had an owner would otherwise leave one behind.
+ */
 export function runOwnerIsLive(runDir: string): boolean {
   const databasePath = join(runDir, OWNER_DATABASE_FILE);
-  return existsSync(databasePath) && probeSqliteLock(databasePath) === "held";
+  try {
+    return existsSync(databasePath) && probeSqliteLock(databasePath) === "held";
+  } catch {
+    return false;
+  }
 }
 
 function readOwner(runDir: string): RunOwnerRecord | undefined {

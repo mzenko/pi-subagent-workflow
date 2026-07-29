@@ -406,15 +406,20 @@ test("workflow worker preempts a loop after attaching then to an unawaited agent
 });
 
 test("host agent completions do not extend the blocked-worker watchdog", async () => {
-  const delays: Record<string, number> = { a: 0, b: 70, c: 140, d: 210 };
+  // Discriminate on the workflow's own timeline, not the clock. The last agent
+  // resolves a full second out, so a watchdog that let host completions postpone
+  // it could only reach the rejection after that call had landed. Asserting an
+  // absolute elapsed budget instead would just be a slow machine away from red.
+  const delays: Record<string, number> = { a: 0, b: 70, c: 140, d: 1_000 };
+  const completed = new Set<string>();
   const staggeredApi = {
     ...api,
     agent: async (prompt: string) => {
       await new Promise((resolve) => setTimeout(resolve, delays[prompt] ?? 0));
+      completed.add(prompt);
       return prompt;
     },
   };
-  const startedAt = Date.now();
 
   await expect(executeWorkflowBody(`
     return parallel([
@@ -426,7 +431,7 @@ test("host agent completions do not extend the blocked-worker watchdog", async (
   `, "staggered-watchdog", staggeredApi, 100))
     .rejects.toThrow(/uninterrupted synchronous execution|timed out/i);
 
-  expect(Date.now() - startedAt).toBeLessThan(250);
+  expect(completed.has("d")).toBe(false);
 });
 
 test("workflow worker permits a long awaited agent call", async () => {
@@ -808,9 +813,16 @@ test("worker entry redirects to compiled JS under node_modules", () => {
   );
 });
 
-test("worker entry keeps source when compiled worker is missing or module is already JS", () => {
+test("an installed package with no compiled worker fails loudly", () => {
+  // Falling back to the .ts source here is guaranteed to fail - Node refuses to
+  // type-strip under node_modules - so it only re-created the bug this redirect
+  // prevents, reported as an opaque loader error. Name the real problem instead.
   const tsSource = "file:///app/node_modules/pi-subagent-workflow/src/workflow/vm.ts";
-  expect(resolveWorkerEntryUrl(tsSource, () => false).href).toBe(tsSource);
+  expect(() => resolveWorkerEntryUrl(tsSource, () => false))
+    .toThrow("Workflow worker is missing from the installed package");
+});
+
+test("worker entry leaves an already-compiled module alone", () => {
   const jsSource = "file:///app/node_modules/pi-subagent-workflow/dist/src/workflow/vm.js";
   expect(resolveWorkerEntryUrl(jsSource, () => true).href).toBe(jsSource);
 });

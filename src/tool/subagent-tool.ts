@@ -28,7 +28,6 @@ import {
   renderCallHeader,
   renderSubagentResult,
   type SubagentDetails,
-  type SubagentRowsState,
 } from "../ui/tool-render.js";
 import { appendEntrySafely } from "../ui/entry-markers.js";
 import { buildDeliveryEnvelope, DELIVERY_ENVELOPE_BUDGET } from "../ui/delivery-envelope.js";
@@ -63,7 +62,18 @@ const PER_SPEC_FIELDS = Object.keys(PublicSubagentOptionFields) as Array<keyof t
 
 export type ValidatedSubagentInput =
   | { type: "spawn"; specs: SubagentSpec[] }
-  | { type: "followUp"; id: string; prompt: string };
+  | { type: "followUp"; id: string; prompt: string; label?: string };
+
+/**
+ * Top-level fields a follow-up may not set.
+ *
+ * A fork resumes the source child's persisted session, so its execution
+ * configuration has to come from that child - re-specifying any of it would
+ * describe a different agent than the conversation being continued. `label` is
+ * the exception: it is presentation only, and a follow-up turn usually has a
+ * different purpose than the child it forks from, so it is allowed to say so.
+ */
+const FOLLOW_UP_CONFIG_FIELDS = PER_SPEC_FIELDS.filter((field) => field !== "label");
 
 export function validateSubagentInput(params: SubagentToolInput): ValidatedSubagentInput {
   assertSchemaValue(SubagentToolParameters, params, "subagent input");
@@ -80,10 +90,12 @@ export function validateSubagentInput(params: SubagentToolInput): ValidatedSubag
     if (stray) throw new Error(`With specs, set ${stray} inside each specs entry, not at the top level`);
   }
   if (followUp) {
-    const stray = PER_SPEC_FIELDS.find((field) => params[field] !== undefined);
-    if (stray) throw new Error(`With followUp, ${stray} is invalid at the top level`);
+    const stray = FOLLOW_UP_CONFIG_FIELDS.find((field) => params[field] !== undefined);
+    if (stray) {
+      throw new Error(`With followUp, ${stray} is invalid at the top level: a follow-up resumes the original child's session and inherits its configuration. Only label may be set, to name the new turn.`);
+    }
     if (!params.followUp!.prompt.trim()) throw new Error("Subagent prompt must not be empty");
-    return { type: "followUp", id: params.followUp!.id, prompt: params.followUp!.prompt };
+    return { type: "followUp", id: params.followUp!.id, prompt: params.followUp!.prompt, label: params.label };
   }
   const specs: SubagentSpec[] = batch ? (params.specs as SubagentSpec[]) : [{ prompt: params.prompt!, model: params.model,
     thinkingLevel: params.thinkingLevel as ThinkingLevel | undefined, tools: params.tools, excludeTools: params.excludeTools,
@@ -294,16 +306,30 @@ function optionalStringArray(value: unknown, candidate: FollowUpCandidate, field
 type Detailed = AgentToolResult<SubagentDetails | undefined>;
 type FollowUpResolver = (id: string, prompt: string, cwd: string) => ResolvedFollowUpSpec;
 
+/**
+ * Retitle a forked child when the caller named the new turn.
+ *
+ * Without this the fork keeps the source child's label, so a follow-up chain
+ * reads as three copies of whatever the first child was for. The label is what
+ * shows in the tool row, the status widget, and /agents, so it should describe
+ * the turn being run. A blank label is ignored rather than blanking the row.
+ */
+export function withFollowUpLabel(resolved: ResolvedFollowUpSpec, label: string | undefined): ResolvedFollowUpSpec {
+  return label === undefined || label.trim() === ""
+    ? resolved
+    : { ...resolved, spec: { ...resolved.spec, label } };
+}
+
 export function registerSubagentTool(pi: ExtensionAPI, selfPath: string, widget?: SubagentStatusWidget,
   runner: SubagentRunner = subagentRunner, resolveFollowUp: FollowUpResolver = resolveFollowUpSpec): void {
-  const tool: ToolDefinition<typeof SubagentToolParameters, SubagentDetails | undefined, SubagentRowsState> = {
+  const tool: ToolDefinition<typeof SubagentToolParameters, SubagentDetails | undefined> = {
     name: "subagent", label: "Subagent", parameters: SubagentToolParameters,
-    description: "Spawn one ad-hoc child or fan out up to 16 independent children; when results must feed later spawns or there are more than 16 items, use workflow instead. Each child starts cold with only its self-contained prompt and inherits the parent's provider/model and thinking level unless overridden ('provider/model-id', never a bare model name). Add schema (JSON Schema) for validated structured output. Use isolation: 'worktree' for parallel edits; changes return as a patch, never applied automatically. Do not pre-batch to control concurrency; the global semaphore already paces all spawns. Background delivery is the default; the result arrives as a steered message. With wait: true, an under-budget result is JSON shaped as { type: \"subagent_results\", runId, runDir, results }, plus warning when persistence degraded; oversized results use the bounded prose envelope. followUp: { id, prompt } forks a completed child's persisted session into a new child and run. Compose each child for the task at hand; recurring task shapes belong in skills, not fixed agent personas.",
+    description: "Spawn one ad-hoc child or fan out up to 16 independent children; when results must feed later spawns or there are more than 16 items, use workflow instead. Each child starts cold with only its self-contained prompt and inherits the parent's provider/model and thinking level unless overridden ('provider/model-id', never a bare model name). Add schema (JSON Schema) for validated structured output. Use isolation: 'worktree' for parallel edits; changes return as a patch, never applied automatically. Do not pre-batch to control concurrency; the global semaphore already paces all spawns. Background delivery is the default; the result arrives as a steered message. With wait: true, an under-budget result is JSON shaped as { type: \"subagent_results\", runId, runDir, results }, plus warning when persistence degraded; oversized results use the bounded prose envelope. followUp: { id, prompt } forks a completed child's persisted session into a new child and run; it inherits that child's model, thinking level, tools, schema, cwd, and isolation, so none of those may be set at the top level - label is the one exception and should name the new turn. Compose each child for the task at hand; recurring task shapes belong in skills, not fixed agent personas.",
     async execute(_toolCallId, params, signal, onUpdate, ctx): Promise<Detailed> {
       let input: ValidatedSubagentInput;
       try { input = validateSubagentInput(params); } catch (error) { throw new Error(errorMessage(error)); }
       const spawnSpecs: ChildSpawnSpec[] = input.type === "followUp"
-        ? [resolveFollowUp(input.id, input.prompt, ctx.cwd)]
+        ? [withFollowUpLabel(resolveFollowUp(input.id, input.prompt, ctx.cwd), input.label)]
         : input.specs;
       const specs = spawnSpecs.map(submittedSpec);
       // A call whose every child is doomed by an unknown model fails fast with
@@ -395,7 +421,9 @@ export function registerSubagentTool(pi: ExtensionAPI, selfPath: string, widget?
     },
     renderCall(args, theme) {
       if (args.followUp) {
-        return renderCallHeader({ fanout: false, count: 1, label: `follow-up · ${args.followUp.id}` }, theme);
+        // Prefer the caller's name for the turn; the source child id is the
+        // fallback and stays visible in the run record either way.
+        return renderCallHeader({ fanout: false, count: 1, label: `follow-up · ${args.label ?? args.followUp.id}` }, theme);
       }
       const fanout = Array.isArray(args.specs) && args.specs.length > 1;
       const count = fanout ? args.specs!.length : 1;
@@ -403,7 +431,7 @@ export function registerSubagentTool(pi: ExtensionAPI, selfPath: string, widget?
       return renderCallHeader({ fanout, count, label }, theme);
     },
     renderResult(result, options, theme, context) {
-      return renderSubagentResult(result.details, options, theme, context.state ??= {}, context.invalidate, context.lastComponent);
+      return renderSubagentResult(result, options, theme, context.lastComponent);
     },
   };
   pi.registerTool(tool);

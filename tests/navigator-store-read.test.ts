@@ -295,7 +295,16 @@ test("a same-mtime rewrite with a different size invalidates the projection", ()
   expect(snapshotReads).toBe(2);
 });
 
-test("a same-size rewrite with restored mtime invalidates through ctime", async () => {
+test("a same-size rewrite with restored mtime invalidates through ctime", () => {
+  // The contract is that any change to mtime, ctime, or size invalidates the
+  // cache entry, and ctime is the field that catches a same-size rewrite whose
+  // mtime was restored. Driving that through a real filesystem is not possible
+  // deterministically: tmpfs takes ctime from the kernel's coarse clock, whose
+  // granularity is one jiffy - measured at exactly 4ms here (CONFIG_HZ=250), with
+  // 197 of 200 consecutive writes sharing a timestamp. Any sleep short enough to
+  // keep the suite fast is inside that tick, so the ctime change was a coin flip
+  // and the test failed under load. Vary the stat directly instead: the subject
+  // is the invalidation logic, not the kernel's timestamp resolution.
   const runId = "terminal-ctime-change";
   const oldRecord = {
     runId,
@@ -315,27 +324,36 @@ test("a same-size rewrite with restored mtime invalidates through ctime", async 
   }]);
   const runDir = join(root, encodeCwd(CWD), runId);
   const runPath = join(runDir, "run.json");
-  const fixed = new Date("2026-07-11T12:00:00.000Z");
-  utimesSync(runPath, fixed, fixed);
+
+  // Same size and same mtime across both reads; only ctime moves.
+  const replacement = JSON.stringify(newRecord);
+  expect(Buffer.byteLength(replacement)).toBe(Buffer.byteLength(JSON.stringify(oldRecord)));
+  let ctimeNs = 1_000n;
   let snapshotReads = 0;
   const opts = {
     readSnapshot(path: string) {
       snapshotReads += 1;
       return readRunSnapshot(path);
     },
+    statFile(path: string) {
+      let real;
+      try {
+        real = statSync(path, { bigint: true });
+      } catch {
+        return undefined; // absent file, same as the production reader reports
+      }
+      return path === runPath ? { mtimeNs: 5_000n, ctimeNs, size: real.size } : real;
+    },
   };
 
   expect(readRunSummary(runDir, runId, opts).label).toBe("old-name");
-  const before = statSync(runPath, { bigint: true });
-  const replacement = JSON.stringify(newRecord);
-  expect(BigInt(Buffer.byteLength(replacement))).toBe(before.size);
-  await Bun.sleep(2);
   writeFileSync(runPath, replacement);
-  utimesSync(runPath, fixed, fixed);
-  const after = statSync(runPath, { bigint: true });
-  expect(after.mtimeNs).toBe(before.mtimeNs);
-  expect(after.ctimeNs).not.toBe(before.ctimeNs);
+  ctimeNs = 2_000n;
+  expect(readRunSummary(runDir, runId, opts).label).toBe("new-name");
+  expect(snapshotReads).toBe(2);
 
+  // The same rewrite with an unchanged signature must serve the cache instead.
+  writeFileSync(runPath, JSON.stringify(oldRecord));
   expect(readRunSummary(runDir, runId, opts).label).toBe("new-name");
   expect(snapshotReads).toBe(2);
 });

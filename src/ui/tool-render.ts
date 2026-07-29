@@ -3,13 +3,28 @@
  *
  * The tool streams a SubagentDetails snapshot through onUpdate; pi calls
  * renderResult with that snapshot (isPartial while running, final when settled).
- * Rows recompute elapsed time and the spinner frame from the wall clock on every
- * render, so a lightweight invalidate timer animates them without new snapshots.
+ *
+ * Rows are a pure function of that snapshot and never read the wall clock. Pi
+ * draws inline, and pi-tui escalates to a full redraw - which erases the
+ * terminal's scrollback and snaps the view to the bottom - whenever the first
+ * changed line sits above the visible viewport. A tool row is exactly that: it
+ * keeps its place in the buffer while the conversation grows past it. Anything
+ * clock-derived here (a spinner frame, a ticking elapsed) therefore repaints the
+ * whole screen on every render any component asks for, for the rest of the
+ * session, and the user can never scroll back.
+ *
+ * So the running glyph is static, and elapsed is reported only once a child has
+ * settled and recorded its own end. Live elapsed lives in the /agents navigator,
+ * a full-screen overlay, whose own repaints always land inside the viewport.
+ *
+ * Overlays are exempt for their own repaints only. Shrinking the base line
+ * buffer while one is mounted shifts every overlay line up and forces the same
+ * full redraw - see `paint` in ./status-widget.ts.
  */
 
 import { truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import type { SubagentEvent, SubagentHandle, SubagentSpec, SubagentStatus } from "../types.js";
-import { linesComponent } from "./component.js";
+import { guardedLines, linesComponent } from "./component.js";
 import {
   childLabel,
   clamp,
@@ -23,7 +38,8 @@ import {
   statusGlyph,
   type ThemeLike,
 } from "./format.js";
-import { sanitizeTerminalText } from "./sanitize.js";
+import { sanitizeTerminalText, sanitizeTerminalTextChunks, UNTRUSTED_FIELD_MAX } from "./sanitize.js";
+import { isRecord } from "../util.js";
 
 /** Serializable per-child row snapshot carried in the tool result details. */
 interface ChildSnapshot {
@@ -41,6 +57,48 @@ interface ChildSnapshot {
   error?: string;
 }
 
+const STATUSES = new Set<unknown>(["pending", "running", "completed", "failed", "aborted"]);
+
+/** Finite number, or undefined - so a bad value reads as absent rather than NaN. */
+function number(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/** String, or a fallback - the string fields below are measured and sliced. */
+function text(value: unknown, fallback: string): string {
+  return typeof value === "string" ? value : fallback;
+}
+
+/**
+ * Coerce a details payload into rows that are safe to draw, or undefined.
+ *
+ * `details` is untrusted at render time. Pi hands back whatever the tool result
+ * carried, and a call this tool *rejected* arrives as a truthy `{}` with no
+ * `children` at all - reading `.children.length` on that threw inside pi's render
+ * loop and killed the TUI, permanently, because the bad result is persisted and
+ * replayed on every resume. Details also survive upgrades, so a resumed session
+ * can replay a snapshot written by a different version of this file.
+ *
+ * Only the fields the renderer would break on are rewritten: `label` and `modelId`
+ * get measured and sliced, the numbers are normalized so a bad snapshot cannot
+ * print "NaN", and `id` keys the per-column cell maps. `thinking`, `activity`,
+ * `resultLine`, and `error` are only ever interpolated, so they pass through.
+ */
+export function safeDetails(details: unknown): SubagentDetails | undefined {
+  if (!isRecord(details) || !Array.isArray(details.children)) return undefined;
+  const children = details.children.filter(isRecord).map((child, index): ChildSnapshot => ({
+    ...child,
+    id: text(child.id, `child-${index}`),
+    label: text(child.label, ""),
+    modelId: text(child.modelId, ""),
+    status: STATUSES.has(child.status) ? child.status as SubagentStatus : "pending",
+    tokens: number(child.tokens) ?? 0,
+    startedAt: number(child.startedAt) ?? 0,
+    endedAt: number(child.endedAt),
+  }));
+  return children.length === 0 ? undefined : { fanout: details.fanout === true, children };
+}
+
 /** Details attached to the subagent tool result for TUI rendering. */
 export interface SubagentDetails {
   fanout: boolean;
@@ -50,12 +108,25 @@ export interface SubagentDetails {
 const LABEL_MIN = 6;
 const LABEL_MAX = 28;
 const MODEL_MAX = 24;
-const ELAPSED_WIDTH = 6;
 /** Wide enough for the longest formatTokens output ("123.4k tok"), so the
  * trailing field still starts at the same column once a child passes 10k. */
 const TOKENS_WIDTH = 10;
 const GAP = "  ";
-/** Rows shown before a collapsed (not expanded) fan-out folds into a count. */
+/**
+ * Rows shown before a collapsed (not expanded) fan-out folds into a count.
+ *
+ * This is a smaller number, not a height bound: an expanded block is 1 + N lines
+ * for N children. A streaming block taller than the terminal has its top rows
+ * above the viewport, so each new snapshot forces the scrollback-erasing full
+ * redraw described above. Measured: 16 children expanded starts erasing at 24
+ * rows or fewer, while the collapsed default is clean from 20 rows up.
+ *
+ * Left as is deliberately. It needs both `wait: true` (the tool description
+ * steers hard against it) and the user opting into expansion, it predates the
+ * clock fix rather than following from it, and capping the rows would blank out
+ * exactly the detail expanding asked for. pi's own bash tool streams expanded
+ * output uncapped and adds a 1Hz invalidate on top.
+ */
 const COLLAPSED_ROWS = 8;
 
 function truncateActivity(text: string): string {
@@ -122,13 +193,21 @@ function trailing(child: ChildSnapshot, theme: ThemeLike): string {
   return "";
 }
 
+/** Wall-clock duration, known only once a child has recorded its own end. */
+function elapsedCell(child: ChildSnapshot): string {
+  return child.endedAt === undefined ? "" : formatDuration(child.endedAt - child.startedAt);
+}
+
 /**
  * Render the per-child rows (and a fan-out header) as width-clamped lines.
  * Columns align across children; the trailing field flexes and is clipped to the
  * terminal width by truncateToWidth (ANSI-aware).
  */
-export function renderRows(details: SubagentDetails, theme: ThemeLike, width: number, now: number, animate: boolean, expanded = true): string[] {
-  const cap = Math.max(20, width);
+export function renderRows(details: SubagentDetails, theme: ThemeLike, width: number, expanded = true): string[] {
+  // Never exceed the host-supplied width: pi-tui aborts the process on any
+  // over-wide line, so there is no minimum layout width worth crashing for. A
+  // cramped row is a cosmetic problem; a wide one ends the session.
+  const cap = Math.max(1, width);
   const all = details.children;
   const collapsed = !expanded && all.length > COLLAPSED_ROWS;
   const children = collapsed ? all.slice(0, COLLAPSED_ROWS) : all;
@@ -137,19 +216,22 @@ export function renderRows(details: SubagentDetails, theme: ThemeLike, width: nu
   // text rather than the model id alone.
   const modelCells = new Map(children.map((child) => [child.id, modelEffort(child.modelId, child.thinking, MODEL_MAX)]));
   const modelWidth = clamp(Math.max(0, ...[...modelCells.values()].map((cell) => cell.length)), 0, MODEL_MAX);
+  // Duration exists only for settled children, so the column collapses away
+  // entirely while a fan-out is still running instead of reserving blank space.
+  const elapsedCells = new Map(children.map((child) => [child.id, elapsedCell(child)]));
+  const elapsedWidth = Math.max(0, ...[...elapsedCells.values()].map((cell) => cell.length));
 
   const lines: string[] = [];
-  if (details.fanout) lines.push(truncateToWidth(renderHeader(details, theme, now, animate), cap));
+  if (details.fanout) lines.push(truncateToWidth(renderHeader(details, theme), cap));
 
   for (const child of children) {
-    const glyph = statusGlyph(child.status, theme, now, animate);
+    const glyph = statusGlyph(child.status, theme, 0, false);
     const label = truncateToWidth(child.label, labelWidth, "…", true);
-    const elapsedMs = (child.endedAt ?? now) - child.startedAt;
-    const elapsed = theme.fg("dim", padStart(formatDuration(elapsedMs), ELAPSED_WIDTH));
     const tokens = theme.fg("dim", padStart(`${formatTokens(child.tokens)} tok`, TOKENS_WIDTH));
     const cells = [`${glyph} ${label}`];
     if (modelWidth > 0) cells.push(theme.fg("dim", truncateToWidth(sanitizeTerminalText(modelCells.get(child.id) ?? ""), modelWidth, "…", true)));
-    cells.push(elapsed, tokens);
+    if (elapsedWidth > 0) cells.push(theme.fg("dim", padStart(elapsedCells.get(child.id) ?? "", elapsedWidth)));
+    cells.push(tokens);
     const rest = trailing(child, theme);
     const head = cells.join(GAP);
     const line = rest ? `${head}${GAP}${rest}` : head;
@@ -159,10 +241,10 @@ export function renderRows(details: SubagentDetails, theme: ThemeLike, width: nu
   return lines;
 }
 
-function renderHeader(details: SubagentDetails, theme: ThemeLike, now: number, animate: boolean): string {
+function renderHeader(details: SubagentDetails, theme: ThemeLike): string {
   const counts = countStatuses(details.children.map((child) => child.status));
   const marker = counts.active
-    ? statusGlyph("running", theme, now, animate)
+    ? statusGlyph("running", theme, 0, false)
     : theme.fg(counts.failed > 0 ? "error" : "success", "●");
   const parts: string[] = [`${counts.done}/${counts.total} done`];
   if (counts.running > 0) parts.push(theme.fg("accent", `${counts.running} running`));
@@ -187,50 +269,51 @@ export function callHeaderLine(info: CallHeaderInfo, theme: ThemeLike): string {
 
 /** Single-line call header component shown above the rows. */
 export function renderCallHeader(info: CallHeaderInfo, theme: ThemeLike): Component {
-  return linesComponent((width) => [truncateToWidth(callHeaderLine(info, theme), Math.max(20, width))]);
+  return linesComponent((width) => [truncateToWidth(callHeaderLine(info, theme), Math.max(1, width))], "subagent call header");
 }
 
-export interface SubagentRowsState {
-  interval?: ReturnType<typeof setInterval>;
-}
-
-/** Component that recomputes rows (elapsed, spinner) from the clock every render. */
+/** Component rendering rows straight from the latest snapshot. */
 class SubagentRowsComponent implements Component {
   private details: SubagentDetails | undefined;
-  private animate = false;
+  private fallback: string[] = [];
   private expanded = true;
+  private readonly draw = guardedLines("subagent rows", (width) => this.details
+    ? renderRows(this.details, this.theme, width, this.expanded)
+    : this.fallback.map((line) => truncateToWidth(line, Math.max(1, width))));
   constructor(private readonly theme: ThemeLike) {}
-  set(details: SubagentDetails | undefined, animate: boolean, expanded: boolean): void {
-    this.details = details;
-    this.animate = animate;
+  /** Stores the normalized snapshot; `details` is untrusted here. */
+  set(details: unknown, fallback: string[], expanded: boolean): void {
+    this.details = safeDetails(details);
+    this.fallback = fallback;
     this.expanded = expanded;
   }
   render(width: number): string[] {
-    if (!this.details || this.details.children.length === 0) return [];
-    return renderRows(this.details, this.theme, Math.max(1, width), Date.now(), this.animate, this.expanded);
+    return this.draw(width);
   }
   invalidate(): void {}
 }
 
 /**
- * renderResult hook body. Sets up (and tears down) a ~10Hz invalidate timer while
- * the result is partial so the spinner and elapsed animate between snapshots.
+ * renderResult hook body. No invalidate timer: the rows change only when a new
+ * snapshot arrives, and pi already renders on that.
+ *
+ * Defining renderResult replaces pi's own result rendering outright, so when
+ * there are no drawable rows - a call this tool rejected carries `details: {}` -
+ * the result text has to be shown here or the user never learns why it failed.
  */
 export function renderSubagentResult(
-  details: SubagentDetails | undefined,
-  options: { isPartial: boolean; expanded: boolean },
+  result: { content?: Array<{ type: string; text?: string }>; details?: unknown },
+  options: { expanded: boolean },
   theme: ThemeLike,
-  state: SubagentRowsState,
-  invalidate: () => void,
   lastComponent: Component | undefined,
 ): Component {
-  if (options.isPartial && !state.interval) state.interval = setInterval(invalidate, 100);
-  if (!options.isPartial && state.interval) {
-    clearInterval(state.interval);
-    state.interval = undefined;
-  }
+  const textParts = (result.content ?? [])
+    .flatMap((part) => part.type === "text" && typeof part.text === "string" ? [part.text] : []);
+  const fallback = textParts.length === 0
+    ? []
+    : sanitizeTerminalTextChunks(textParts, UNTRUSTED_FIELD_MAX, true).split("\n");
   const component = lastComponent instanceof SubagentRowsComponent ? lastComponent : new SubagentRowsComponent(theme);
-  component.set(details, options.isPartial, options.expanded);
+  component.set(result.details, fallback, options.expanded);
   return component;
 }
 

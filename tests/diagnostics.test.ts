@@ -1,7 +1,7 @@
-import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, expect, spyOn, test } from "bun:test";
 import { chmodSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { markTuiSession, reportDiagnostic } from "../src/diagnostics.js";
+import { reportDiagnostic, setTuiSession } from "../src/diagnostics.js";
 
 const logPath = join(process.env.PI_CODING_AGENT_DIR!, "subagent-workflow", "diagnostics.log");
 const rotatedPath = `${logPath}.1`;
@@ -10,6 +10,11 @@ beforeAll(() => {
   rmSync(logPath, { force: true });
   rmSync(rotatedPath, { force: true });
 });
+
+// The TUI flag is process-wide, so each test states the routing it needs and
+// hands back the default. Leaving it set leaked into every later test file that
+// asserts on console.error, which then passed or failed on file ordering alone.
+afterEach(() => setTuiSession(false));
 
 afterAll(() => {
   rmSync(logPath, { force: true });
@@ -23,7 +28,7 @@ test("diagnostics default to sanitized stderr and route to a file after a TUI se
     expect(errorLog).toHaveBeenCalledWith("default red");
     expect(() => readFileSync(logPath, "utf8")).toThrow();
 
-    markTuiSession();
+    setTuiSession();
     reportDiagnostic("file route");
     expect(readFileSync(logPath, "utf8")).toContain("file route");
     expect(errorLog).toHaveBeenCalledTimes(1);
@@ -33,6 +38,7 @@ test("diagnostics default to sanitized stderr and route to a file after a TUI se
 });
 
 test("diagnostic log lines strip terminal control bytes", () => {
+  setTuiSession();
   rmSync(logPath, { force: true });
   reportDiagnostic("safe\x1b]0;hostile-title\x07 text\x00 end");
 
@@ -44,6 +50,7 @@ test("diagnostic log lines strip terminal control bytes", () => {
 });
 
 test("a permissive file crossing the diagnostics cap rotates with both files restricted", () => {
+  setTuiSession();
   rmSync(logPath, { force: true });
   rmSync(rotatedPath, { force: true });
   mkdirSync(dirname(logPath), { recursive: true });
@@ -62,6 +69,7 @@ test("a permissive file crossing the diagnostics cap rotates with both files res
 });
 
 test("diagnostics enforce mode 0600 on a pre-existing file", () => {
+  setTuiSession();
   writeFileSync(logPath, "old incident\n");
   chmodSync(logPath, 0o666);
 

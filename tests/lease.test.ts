@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -108,4 +108,26 @@ test("a conflict reports the pid, host, and start time from owner metadata", () 
   expect((conflict as Error).message).toBe(
     "Run is active in another owner (pid 4242 on " + hostname() + ", started at 2026-07-12T10:00:00.000Z)",
   );
+});
+
+test("liveness reports not-live when the owner database cannot be opened", () => {
+  // The probe races anything that deletes a run directory, and existsSync cannot
+  // close that window: the file can vanish between the check and the open, which
+  // surfaces as SQLITE_CANTOPEN. Readers include the /agents disk projection, so a
+  // throw would reach a render path - and it made the suite flaky, because tests
+  // remove their temp roots while async work is still probing. An unopenable
+  // owner database is stood in for here by a directory of the same name.
+  const runDir = runDirectory("lease-unopenable-");
+  try {
+    mkdirSync(join(runDir, "owner.sqlite"));
+    expect(runOwnerIsLive(runDir)).toBe(false);
+  } finally {
+    rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
+test("liveness reports not-live for a run directory that no longer exists", () => {
+  const runDir = runDirectory("lease-vanished-");
+  rmSync(runDir, { recursive: true, force: true });
+  expect(runOwnerIsLive(runDir)).toBe(false);
 });

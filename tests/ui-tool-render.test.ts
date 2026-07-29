@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { PLAIN } from "../src/ui/format.js";
+import { PLAIN, SPINNER } from "../src/ui/format.js";
 import { callHeaderLine, renderRows, SubagentRowTracker, type SubagentDetails } from "../src/ui/tool-render.js";
 import type { SubagentEvent, SubagentHandle, UsageSummary } from "../src/types.js";
 
@@ -52,12 +52,45 @@ test("renderRows shows a live running row with all columns", () => {
     fanout: false,
     children: [{ id: "c1", label: "build", modelId: "gpt-5.6-sol", status: "running", tokens: 12_345, startedAt: 0, activity: "reading files" }],
   };
-  const [row] = renderRows(details, PLAIN, 200, 3_400, true);
+  const [row] = renderRows(details, PLAIN, 200);
   expect(row).toContain("build");
   expect(row).toContain("gpt-5.6-sol");
-  expect(row).toContain("3.4s");
   expect(row).toContain("12.3k tok");
   expect(row).toContain("reading files");
+});
+
+test("rows carry nothing clock-derived, so an idle tool row never repaints", () => {
+  // Pi draws inline and pi-tui falls back to a full redraw - which erases the
+  // scrollback - as soon as a changed line sits above the visible viewport. A
+  // tool row ends up there the moment the conversation grows past it, so a
+  // ticking elapsed or an animated spinner here would wipe the user's scrollback
+  // on every render, for the rest of the session.
+  const details: SubagentDetails = {
+    fanout: true,
+    children: [
+      { id: "c1", label: "build", modelId: "m", status: "running", tokens: 100, startedAt: 0, activity: "working" },
+      { id: "c2", label: "lint", modelId: "m", status: "pending", tokens: 0, startedAt: 0 },
+    ],
+  };
+  const lines = renderRows(details, PLAIN, 200);
+  for (const frame of SPINNER) expect(lines.join("\n")).not.toContain(frame);
+  // No child has settled, so the duration column is absent rather than ticking.
+  expect(lines.join("\n")).not.toMatch(/\d+(\.\d)?s/);
+});
+
+test("a settled child reports its own duration and a running sibling shows none", () => {
+  const details: SubagentDetails = {
+    fanout: true,
+    children: [
+      { id: "c1", label: "done", modelId: "m", status: "completed", tokens: 10, startedAt: 1_000, endedAt: 4_500, resultLine: "finished" },
+      { id: "c2", label: "busy", modelId: "m", status: "running", tokens: 20, startedAt: 1_000, activity: "still going" },
+    ],
+  };
+  const [, first, second] = renderRows(details, PLAIN, 200);
+  expect(first).toContain("3.5s");
+  expect(second).not.toMatch(/\d+(\.\d)?s/);
+  // The blank duration cell keeps its width, so the trailing field still aligns.
+  expect(first!.indexOf("finished")).toBe(second!.indexOf("still going"));
 });
 
 test("renderRows aligns labels across children and adds a fan-out header", () => {
@@ -68,7 +101,7 @@ test("renderRows aligns labels across children and adds a fan-out header", () =>
       { id: "c2", label: "longer-label", modelId: "m", status: "failed", tokens: 20, startedAt: 0, endedAt: 2_000, error: "boom" },
     ],
   };
-  const lines = renderRows(details, PLAIN, 200, 3_000, false);
+  const lines = renderRows(details, PLAIN, 200);
   expect(lines[0]).toContain("fan-out");
   expect(lines[0]).toContain("2/2 done");
   expect(lines[0]).toContain("1 failed");
@@ -80,9 +113,9 @@ test("renderRows aligns labels across children and adds a fan-out header", () =>
 test("renderRows folds a large collapsed fan-out into a count", () => {
   const children = Array.from({ length: 12 }, (_, index) => ({ id: `c${index}`, label: `agent ${index}`, modelId: "m", status: "running" as const, tokens: 100, startedAt: 0 }));
   const details: SubagentDetails = { fanout: true, children };
-  const collapsed = renderRows(details, PLAIN, 200, 1_000, true, false);
+  const collapsed = renderRows(details, PLAIN, 200, false);
   expect(collapsed.some((line) => line.includes("+4 more (expand to view)"))).toBe(true);
-  const expanded = renderRows(details, PLAIN, 200, 1_000, true, true);
+  const expanded = renderRows(details, PLAIN, 200, true);
   expect(expanded.some((line) => line.includes("more (expand"))).toBe(false);
   expect(expanded.length).toBe(children.length + 1); // header + all rows
 });
@@ -92,7 +125,7 @@ test("renderRows never exceeds the terminal width", () => {
     fanout: false,
     children: [{ id: "c1", label: "a very long label that should be truncated hard", modelId: "some-model", status: "running", tokens: 999, startedAt: 0, activity: "x".repeat(300) }],
   };
-  for (const line of renderRows(details, PLAIN, 40, 1_000, true)) {
+  for (const line of renderRows(details, PLAIN, 40)) {
     expect(visibleWidth(line)).toBeLessThanOrEqual(40);
   }
 });
@@ -106,7 +139,7 @@ test("renderRows shows reasoning effort beside the model and aligns the trailing
       { id: "c2", label: "lint", modelId: "haiku-4-5", thinking: "off", status: "completed", tokens: 800, startedAt: 0, endedAt: 1_000, resultLine: "clean" },
     ],
   };
-  const [, first, second] = renderRows(details, PLAIN, 200, 3_400, false);
+  const [, first, second] = renderRows(details, PLAIN, 200);
   expect(first).toContain("gpt-5.6-sol·high");
   expect(second).toContain("haiku-4-5");
   expect(second).not.toContain("off");
@@ -120,7 +153,7 @@ test("renderRows keeps effort visible when the model id fills the cell", () => {
     fanout: false,
     children: [{ id: "c1", label: "verify", modelId: "claude-opus-4-5-20251101", thinking: "xhigh", status: "running", tokens: 0, startedAt: 0 }],
   };
-  const [row] = renderRows(details, PLAIN, 200, 1_000, false);
+  const [row] = renderRows(details, PLAIN, 200);
   expect(row).toContain("·xhigh");
   expect(row).toContain("…");
 });
