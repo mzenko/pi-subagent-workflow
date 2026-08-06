@@ -21,6 +21,7 @@ import { reportDiagnostic } from "../../diagnostics.js";
 import { errorMessage } from "../../util.js";
 import { formatTokens, type ThemeLike } from "../format.js";
 import { sanitizeTerminalText } from "../sanitize.js";
+import { suppressInlineImages } from "../suppress-inline-images.js";
 import { AgentView } from "./agent-view.js";
 import { cycleFilter, footerHint, keyToAction, orderedChildren, runActionAvailability, type RunActionAvailability } from "./controls.js";
 import { NavigatorModel, NavigatorState } from "./model.js";
@@ -35,8 +36,6 @@ export interface NavigatorRunner {
   liveSession(childId: string): ChildSession | undefined;
   get(childId: string): SubagentHandle | undefined;
   stopRun(runId: string): Promise<void>;
-  waitedRunIds(parentSessionId: string): string[];
-  detachWaitedRun(runId: string, parentSessionId: string): boolean;
   subscribeSpawns(listener: (run: SpawnedRun) => void): () => void;
 }
 
@@ -191,6 +190,7 @@ function openNavigator(services: NavigatorServices, ctx: NavigatorOpenContext, m
         disposeAgentView();
         if (timer) clearInterval(timer);
         timer = undefined;
+        restoreImages();
       };
       const finish = () => {
         cleanup();
@@ -207,7 +207,6 @@ function openNavigator(services: NavigatorServices, ctx: NavigatorOpenContext, m
         detail,
         runner.liveRunIds().includes(detail.runId),
         runner.runHandles(detail.runId).map((handle) => handle.status),
-        runner.waitedRunIds(ctx.sessionManager.getSessionId()).includes(detail.runId),
         services.saveWorkflowScript !== undefined && isCommandContext(ctx),
       );
 
@@ -240,17 +239,6 @@ function openNavigator(services: NavigatorServices, ctx: NavigatorOpenContext, m
           stoppingRunId = undefined;
           rerender();
         }
-      };
-
-      const backgroundRun = () => {
-        const runId = state.currentRunId(model.runs());
-        if (!runId) return;
-        if (!runner.detachWaitedRun(runId, ctx.sessionManager.getSessionId())) {
-          ctx.ui.notify("Run is not blocking a waited tool call", "info");
-          return;
-        }
-        ctx.ui.notify(`Backgrounded ${runId}; the result will arrive as a steered message`, "info");
-        rerender();
       };
 
       const saveSelected = async () => {
@@ -333,9 +321,6 @@ function openNavigator(services: NavigatorServices, ctx: NavigatorOpenContext, m
           case "stop":
             void stopRun();
             return;
-          case "background":
-            backgroundRun();
-            return;
           case "save":
             void saveSelected();
             return;
@@ -344,6 +329,12 @@ function openNavigator(services: NavigatorServices, ctx: NavigatorOpenContext, m
         }
         rerender();
       };
+
+      // Inline images paint over overlays (see suppress-inline-images.ts);
+      // hide them while the navigator is up. Registered last: anything above
+      // that throws would reject the factory without running dispose, and the
+      // patch would then outlive the overlay.
+      const restoreImages = suppressInlineImages(tui);
 
       const component: Component & { dispose?(): void } = {
         render: (width: number) => {
@@ -438,7 +429,7 @@ function renderContent(
   }
   state.reconcileRuns(runs);
   const selectedRunId = state.currentRunId(runs);
-  const actions = selectedRunId ? actionsFor(model.detail(selectedRunId)) : { canStop: false, canBackground: false, canSave: false };
+  const actions = selectedRunId ? actionsFor(model.detail(selectedRunId)) : { canStop: false, canSave: false };
   return {
     lines: renderRunList(runs, state.cursor, theme, inner, now, budget),
     footer: footerHint({

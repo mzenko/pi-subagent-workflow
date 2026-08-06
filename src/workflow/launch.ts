@@ -8,15 +8,10 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ParentContext } from "../runner/child.js";
 import { subagentRunner } from "../runner/runner.js";
 import { activityFoldFromSnapshot, type RunActivityFold } from "../store/activity-fold.js";
-import {
-  DELIVERY_PROTOCOL_VERSION,
-  queueAcknowledgedDelivery,
-  writeDeliveryMarker,
-  type RunDeliveryIdentity,
-} from "../store/delivery-marker.js";
+import { DELIVERY_PROTOCOL_VERSION, queueAcknowledgedDelivery, writeDeliveryMarker, type RunDeliveryIdentity } from "../store/delivery-marker.js";
 import { readRunSnapshot } from "../store/run-snapshot.js";
 import type { WorkflowPhase } from "../types.js";
-import { buildDeliveryEnvelope, DELIVERY_ENVELOPE_BUDGET } from "../ui/delivery-envelope.js";
+import { buildDeliveryEnvelope } from "../ui/delivery-envelope.js";
 import { chunkDeliveryText, formatFailureText, safeDeliveryValue, stringifyDeliveryJson } from "../ui/delivery-safe.js";
 import { appendEntrySafely } from "../ui/entry-markers.js";
 import { reportDiagnostic } from "../diagnostics.js";
@@ -167,23 +162,34 @@ export function formatWorkflowFailure(error: unknown): string {
   });
 }
 
-export function completeWorkflow<T>(pi: ExtensionAPI, result: WorkflowRunResult, sessionId: string, deliver: () => T): T {
-  recordWorkflowCompleted(pi, result);
-  const delivered = deliver();
-  if (!writeDeliveryMarker(result.runDir, sessionId, workflowDeliveryIdentity(result.generation))) {
-    throw new Error(`Workflow run ${result.runId} changed generation before inline delivery could be recorded`);
+/**
+ * Inline (headless) completion: record, deliver the same envelope background
+ * mode would have steered, and fence redelivery. Headless hosts end the
+ * session when the turn ends, so this is the only path a result can take
+ * there.
+ */
+export function completeWorkflowInline(pi: ExtensionAPI, result: WorkflowRunResult, sessionId: string): string {
+  try {
+    recordWorkflowCompleted(pi, result);
+    const message = formatWorkflowDelivery(result);
+    if (!writeDeliveryMarker(result.runDir, sessionId, workflowDeliveryIdentity(result.generation))) {
+      throw new Error(`Workflow run ${result.runId} changed generation before inline delivery could be recorded`);
+    }
+    return message;
+  } finally {
+    subagentRunner.releaseRunActivity(result.runId);
   }
-  return delivered;
 }
 
-export function completeWorkflowFailure<T>(error: unknown, sessionId: string, deliver: (message: string) => T): T {
+/** Inline (headless) failure: format the failure envelope and fence redelivery. */
+export function completeWorkflowFailureInline(error: unknown, sessionId: string): Error {
   try {
-    const delivered = deliver(formatWorkflowFailure(error));
+    const message = formatWorkflowFailure(error);
     if (error instanceof WorkflowRunError && error.generation !== undefined
       && !writeDeliveryMarker(error.runDir, sessionId, workflowDeliveryIdentity(error.generation))) {
-      throw new Error(`Workflow run ${error.runId} changed generation before inline failure delivery could be recorded`);
+      return new Error(`Workflow run ${error.runId} changed generation before inline failure delivery could be recorded`);
     }
-    return delivered;
+    return new Error(message);
   } finally {
     if (error instanceof WorkflowRunError) subagentRunner.releaseRunActivity(error.runId);
   }
@@ -232,26 +238,6 @@ function formatGroupedFailures(failedChildren: WorkflowRunResult["failedChildren
     return `${group.count} failed child${group.count === 1 ? "" : "ren"} (${labels}): ${formatFailureText(group.error)}`;
   });
 }
-
-export function formatWorkflowResult(result: WorkflowRunResult): string {
-  try {
-    // stringifyDeliveryJson, not raw JSON.stringify: workflow results can
-    // carry DEL/C1 controls that must not reach the parent transcript raw.
-    const structured = stringifyDeliveryJson({
-      type: "workflow_result",
-      runId: result.runId,
-      runDir: result.runDir,
-      status: workflowStatus(result),
-      result: result.result,
-      ...(result.failedChildren.length === 0 ? {} : { failedChildren: result.failedChildren }),
-      ...(result.persistenceWarning === undefined ? {} : { warning: result.persistenceWarning }),
-    });
-    return structured.length <= DELIVERY_ENVELOPE_BUDGET ? structured : formatWorkflowEnvelope(result);
-  } finally {
-    subagentRunner.releaseRunActivity(result.runId);
-  }
-}
-
 
 const TOOL_ACTIVITY_GROUP_CAP = 64;
 const TOOL_ACTIVITY_EXAMPLE_CAP = 5;

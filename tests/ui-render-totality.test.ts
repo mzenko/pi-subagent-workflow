@@ -29,7 +29,7 @@ const REJECTED = {
 };
 
 test("a rejected subagent call renders its error instead of crashing the TUI", () => {
-  const component = renderSubagentResult(REJECTED, { expanded: false }, PLAIN, undefined);
+  const component = renderSubagentResult(REJECTED, PLAIN, undefined);
   const lines = component.render(120);
   expect(lines.join("\n")).toContain("With followUp, tools is invalid at the top level");
 });
@@ -48,18 +48,16 @@ test("safeDetails fills in a malformed child but drops a non-object entry", () =
   // the row would hide that a child exists at all. An entry that is not an object
   // carries nothing to show, so it goes.
   const normalized = safeDetails({
-    children: [{}, { id: "c2", status: "bogus", tokens: "x", label: 7, modelId: 9 }, "junk", null],
+    children: [{}, { id: "c2", label: 7, modelId: 9 }, "junk", null],
   });
   expect(normalized?.children.length).toBe(2);
-  expect(normalized?.children[0]).toMatchObject({ id: "child-0", label: "", status: "pending", tokens: 0, startedAt: 0 });
-  expect(normalized?.children[1]).toMatchObject({ id: "c2", label: "", modelId: "", status: "pending", tokens: 0 });
-  expect(normalized?.fanout).toBe(false);
+  expect(normalized?.children[0]).toMatchObject({ id: "child-0", label: "", modelId: "" });
+  expect(normalized?.children[1]).toMatchObject({ id: "c2", label: "", modelId: "" });
 });
 
 test("subagent rows survive a details payload full of wrong types", () => {
   const component = renderSubagentResult(
-    { content: [], details: { fanout: "yes", children: [{ id: 1, status: {}, startedAt: "nope", endedAt: Number.NaN }] } },
-    { expanded: true },
+    { content: [], details: { children: [{ id: 1, status: {}, label: null, thinking: 4 }] } },
     PLAIN,
     undefined,
   );

@@ -1,62 +1,25 @@
 import { expect, test } from "bun:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { PLAIN, SPINNER } from "../src/ui/format.js";
-import { callHeaderLine, renderRows, SubagentRowTracker, type SubagentDetails } from "../src/ui/tool-render.js";
-import type { SubagentEvent, SubagentHandle, UsageSummary } from "../src/types.js";
+import { callHeaderLine, renderRows, type SubagentDetails } from "../src/ui/tool-render.js";
 
 test("call header strips terminal escapes from the label", () => {
   const ESC = "\u001b";
   const BEL = "\u0007";
   // CSI screen-clear, then a BEL-terminated OSC title-set, in an otherwise plain label.
   const label = `run${ESC}[2J${ESC}]0;pwned${BEL}ok`;
-  const line = callHeaderLine({ fanout: false, label }, PLAIN);
+  const line = callHeaderLine(label, PLAIN);
   expect(line).not.toContain(ESC);
-  expect(line).toContain("subagent \u00b7 runok");
+  expect(line).toContain("subagent · runok");
 });
 
-const usage = (input: number, output: number): UsageSummary => ({ input, output, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 });
-
-function fakeHandle(over: Partial<SubagentHandle> & { id: string }): SubagentHandle {
-  return {
-    runId: "run-1",
-    runDir: "/runs/run-1",
-    spec: { prompt: "do a thing" },
-    resolved: undefined,
-    status: "running",
-    startedAt: 0,
-    result: Promise.resolve() as never,
-    steer: async () => {},
-    abort: async () => {},
-    subscribe: () => () => {},
-    ...over,
-  } as SubagentHandle;
-}
-
-test("tracker overlays streaming activity/tokens/result onto live handle state", () => {
-  const tracker = new SubagentRowTracker(false, () => 5_000);
-  const handle = fakeHandle({ id: "c1", spec: { prompt: "p", label: "build" }, resolved: { provider: "openai-codex", modelId: "openai-codex/gpt-5.6-sol", thinkingLevel: "off", tools: [], cwd: "/", label: "build" }, status: "running", startedAt: 1_000 });
-
-  tracker.observe({ type: "activity", id: "c1", description: "bash   {\"cmd\":\"ls\"}" } as SubagentEvent);
-  tracker.observe({ type: "usage", id: "c1", usage: usage(100, 40) } as SubagentEvent);
-  const snap = tracker.snapshot([handle]);
-  expect(snap.children[0]).toMatchObject({ id: "c1", label: "build", modelId: "gpt-5.6-sol", tokens: 140, startedAt: 1_000 });
-  expect(snap.children[0]!.activity).toBe('bash {"cmd":"ls"}');
-
-  tracker.observe({ type: "result", id: "c1", result: { id: "c1", status: "completed", text: "All good\nmore", usage: usage(120, 60), resolved: handle.resolved! } } as SubagentEvent);
-  const done = tracker.snapshot([{ ...handle, status: "completed" } as SubagentHandle]);
-  expect(done.children[0]).toMatchObject({ status: "completed", tokens: 180, resultLine: "All good", endedAt: 5_000 });
-});
-
-test("renderRows shows a live running row with all columns", () => {
+test("renderRows shows the launch receipt row", () => {
   const details: SubagentDetails = {
-    fanout: false,
-    children: [{ id: "c1", label: "build", modelId: "gpt-5.6-sol", status: "running", tokens: 12_345, startedAt: 0, activity: "reading files" }],
+    children: [{ id: "c1", label: "build", modelId: "gpt-5.6-sol" }],
   };
   const [row] = renderRows(details, PLAIN, 200);
   expect(row).toContain("build");
   expect(row).toContain("gpt-5.6-sol");
-  expect(row).toContain("12.3k tok");
-  expect(row).toContain("reading files");
 });
 
 test("rows carry nothing clock-derived, so an idle tool row never repaints", () => {
@@ -66,92 +29,53 @@ test("rows carry nothing clock-derived, so an idle tool row never repaints", () 
   // ticking elapsed or an animated spinner here would wipe the user's scrollback
   // on every render, for the rest of the session.
   const details: SubagentDetails = {
-    fanout: true,
-    children: [
-      { id: "c1", label: "build", modelId: "m", status: "running", tokens: 100, startedAt: 0, activity: "working" },
-      { id: "c2", label: "lint", modelId: "m", status: "pending", tokens: 0, startedAt: 0 },
-    ],
+    children: [{ id: "c1", label: "build", modelId: "m" }],
   };
   const lines = renderRows(details, PLAIN, 200);
   for (const frame of SPINNER) expect(lines.join("\n")).not.toContain(frame);
-  // No child has settled, so the duration column is absent rather than ticking.
   expect(lines.join("\n")).not.toMatch(/\d+(\.\d)?s/);
 });
 
-test("a settled child reports its own duration and a running sibling shows none", () => {
+test("renderRows aligns the model column across a legacy multi-child snapshot", () => {
+  // Older sessions persisted several children per call; those snapshots still
+  // draw on resume and keep their columns aligned.
   const details: SubagentDetails = {
-    fanout: true,
     children: [
-      { id: "c1", label: "done", modelId: "m", status: "completed", tokens: 10, startedAt: 1_000, endedAt: 4_500, resultLine: "finished" },
-      { id: "c2", label: "busy", modelId: "m", status: "running", tokens: 20, startedAt: 1_000, activity: "still going" },
-    ],
-  };
-  const [, first, second] = renderRows(details, PLAIN, 200);
-  expect(first).toContain("3.5s");
-  expect(second).not.toMatch(/\d+(\.\d)?s/);
-  // The blank duration cell keeps its width, so the trailing field still aligns.
-  expect(first!.indexOf("finished")).toBe(second!.indexOf("still going"));
-});
-
-test("renderRows aligns labels across children and adds a fan-out header", () => {
-  const details: SubagentDetails = {
-    fanout: true,
-    children: [
-      { id: "c1", label: "a", modelId: "m", status: "completed", tokens: 10, startedAt: 0, endedAt: 1_000, resultLine: "ok" },
-      { id: "c2", label: "longer-label", modelId: "m", status: "failed", tokens: 20, startedAt: 0, endedAt: 2_000, error: "boom" },
+      { id: "c1", label: "a", modelId: "m" },
+      { id: "c2", label: "longer-label", modelId: "m" },
     ],
   };
   const lines = renderRows(details, PLAIN, 200);
-  expect(lines[0]).toContain("fan-out");
-  expect(lines[0]).toContain("2/2 done");
-  expect(lines[0]).toContain("1 failed");
-  // The model column starts at the same offset on both rows (labels padded equally).
-  expect(lines[1]!.indexOf(" m")).toBe(lines[2]!.indexOf(" m"));
-  expect(lines[2]).toContain("boom");
-});
-
-test("renderRows folds a large collapsed fan-out into a count", () => {
-  const children = Array.from({ length: 12 }, (_, index) => ({ id: `c${index}`, label: `agent ${index}`, modelId: "m", status: "running" as const, tokens: 100, startedAt: 0 }));
-  const details: SubagentDetails = { fanout: true, children };
-  const collapsed = renderRows(details, PLAIN, 200, false);
-  expect(collapsed.some((line) => line.includes("+4 more (expand to view)"))).toBe(true);
-  const expanded = renderRows(details, PLAIN, 200, true);
-  expect(expanded.some((line) => line.includes("more (expand"))).toBe(false);
-  expect(expanded.length).toBe(children.length + 1); // header + all rows
+  expect(lines).toHaveLength(2);
+  expect(lines[0]!.indexOf(" m")).toBe(lines[1]!.indexOf(" m"));
 });
 
 test("renderRows never exceeds the terminal width", () => {
   const details: SubagentDetails = {
-    fanout: false,
-    children: [{ id: "c1", label: "a very long label that should be truncated hard", modelId: "some-model", status: "running", tokens: 999, startedAt: 0, activity: "x".repeat(300) }],
+    children: [{ id: "c1", label: "a very long label that should be truncated hard", modelId: "some-model" }],
   };
   for (const line of renderRows(details, PLAIN, 40)) {
     expect(visibleWidth(line)).toBeLessThanOrEqual(40);
   }
 });
 
-test("renderRows shows reasoning effort beside the model and aligns the trailing column", () => {
+test("renderRows shows reasoning effort beside the model", () => {
   const details: SubagentDetails = {
-    fanout: true,
     children: [
-      { id: "c1", label: "audit", modelId: "gpt-5.6-sol", thinking: "high", status: "running", tokens: 12_400, startedAt: 0, activity: "grepping" },
+      { id: "c1", label: "audit", modelId: "gpt-5.6-sol", thinking: "high" },
       // "off" is the resting state for non-reasoning models and stays hidden.
-      { id: "c2", label: "lint", modelId: "haiku-4-5", thinking: "off", status: "completed", tokens: 800, startedAt: 0, endedAt: 1_000, resultLine: "clean" },
+      { id: "c2", label: "lint", modelId: "haiku-4-5", thinking: "off" },
     ],
   };
-  const [, first, second] = renderRows(details, PLAIN, 200);
+  const [first, second] = renderRows(details, PLAIN, 200);
   expect(first).toContain("gpt-5.6-sol·high");
   expect(second).toContain("haiku-4-5");
   expect(second).not.toContain("off");
-  // The trailing free-text field starts at the same column on both rows even
-  // though one child crossed 10k tokens and the other did not.
-  expect(first!.indexOf("grepping")).toBe(second!.indexOf("clean"));
 });
 
 test("renderRows keeps effort visible when the model id fills the cell", () => {
   const details: SubagentDetails = {
-    fanout: false,
-    children: [{ id: "c1", label: "verify", modelId: "claude-opus-4-5-20251101", thinking: "xhigh", status: "running", tokens: 0, startedAt: 0 }],
+    children: [{ id: "c1", label: "verify", modelId: "claude-opus-4-5-20251101", thinking: "xhigh" }],
   };
   const [row] = renderRows(details, PLAIN, 200);
   expect(row).toContain("·xhigh");

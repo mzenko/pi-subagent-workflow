@@ -92,7 +92,7 @@ test("widget registers a belowEditor widget while active and clears it when idle
   const listeners: Array<(event: SubagentEvent) => void> = [];
   const first = fakeHandle("c1", listeners);
   const widget = new SubagentStatusWidget();
-  widget.track("run-1", [first.handle], false, ctx);
+  widget.track("run-1", first.handle, ctx);
 
   const registered = calls.filter(([key, value]) => key === "widget:subagent-workflow" && typeof value === "function");
   expect(registered.length).toBeGreaterThan(0);
@@ -108,7 +108,7 @@ test("widget is inert without dialog-capable UI", () => {
   let touched = false;
   const ctx = { hasUI: false, ui: { setWidget: () => { touched = true; }, setStatus: () => { touched = true; } } } as never;
   const widget = new SubagentStatusWidget();
-  widget.track("run-1", [fakeHandle("c1", []).handle], false, ctx);
+  widget.track("run-1", fakeHandle("c1", []).handle, ctx);
   expect(touched).toBe(false);
   widget.dispose();
 });
@@ -124,7 +124,7 @@ test("widget can be hidden and shown live without losing an active run", () => {
   } as never;
   const widget = new SubagentStatusWidget();
   widget.configure(false);
-  widget.track("run-1", [fakeHandle("c1", []).handle], false, ctx);
+  widget.track("run-1", fakeHandle("c1", []).handle, ctx);
   expect(calls.some(([key, value]) => key === "widget:subagent-workflow" && typeof value === "function")).toBe(false);
 
   widget.configure(true);
@@ -147,7 +147,7 @@ test("widget setup failure stops its refresh timer", async () => {
   const widget = new SubagentStatusWidget();
   const errorLog = spyOn(console, "error").mockImplementation(() => {});
   try {
-    expect(() => widget.track("run-1", [fakeHandle("c1", []).handle], false, ctx)).not.toThrow();
+    expect(() => widget.track("run-1", fakeHandle("c1", []).handle, ctx)).not.toThrow();
     const callsAfterFailure = widgetCalls;
     await Bun.sleep(230);
     expect(widgetCalls).toBe(callsAfterFailure);
@@ -194,7 +194,7 @@ test("the widget never shrinks pi's inline buffer while an overlay is mounted", 
   const listeners: Array<(event: SubagentEvent) => void> = [];
   const child = fakeHandle("c1", listeners);
   const widget = new SubagentStatusWidget();
-  widget.track("run-1", [child.handle], false, ctx);
+  widget.track("run-1", child.handle, ctx);
 
   let overlayOpen = true;
   const tui = { hasOverlay: () => overlayOpen, requestRender: () => {}, terminal: { rows: 24 } };
@@ -244,7 +244,7 @@ test("a repaint is skipped only when the painted text is genuinely identical", (
     const child = fakeHandle("c1", listeners);
     (child.handle.spec as { label?: string }).label = label;
     (child.handle.spec as { phase?: string }).phase = phase;
-    widget.track("run-1", [child.handle], false, capture);
+    widget.track("run-1", child.handle, capture);
     const lines = factory!(tui, PLAIN).render(120).join("\n");
     widget.dispose();
     return lines;
@@ -272,7 +272,7 @@ test("workflow rows appear at launch, absorb child spawns, and persist between b
       setStatus: (key: string, text: unknown) => calls.push([`status:${key}`, text]),
     },
   } as never;
-  let spawnListener: ((run: { runId: string; runDir: string; parentSessionId: string; handles: unknown[] }) => void) | undefined;
+  let spawnListener: ((run: { runId: string; runDir: string; parentSessionId: string; handle: unknown }) => void) | undefined;
   let workflowActive = true;
   const runner = {
     subscribeSpawns: (listener: never) => { spawnListener = listener; return () => {}; },
@@ -287,7 +287,7 @@ test("workflow rows appear at launch, absorb child spawns, and persist between b
   const child = fakeHandle("c1", listeners);
   (child.handle as { runId: string }).runId = "workflow-1";
   (child.handle.spec as { phase?: string }).phase = "Research";
-  spawnListener!({ runId: "workflow-1", runDir: "/runs/workflow-1", parentSessionId: "parent", handles: [child.handle] });
+  spawnListener!({ runId: "workflow-1", runDir: "/runs/workflow-1", parentSessionId: "parent", handle: child.handle });
 
   // Child completes; the workflow row persists because the run controller is live.
   child.setStatus("completed");

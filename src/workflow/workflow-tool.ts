@@ -2,15 +2,14 @@ import type { AgentToolResult, ExtensionAPI, ExtensionContext, ToolDefinition } 
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import type { ParentContext } from "../runner/child.js";
-import { subagentRunner } from "../runner/runner.js";
 import type { ThinkingLevel, WorkflowPhase } from "../types.js";
 import { sanitizeTerminalText, sanitizeTerminalTextChunks, UNTRUSTED_FIELD_MAX } from "../ui/sanitize.js";
 import { reportDiagnostic } from "../diagnostics.js";
-import { bindAbort, errorMessage, isRecord } from "../util.js";
+import { errorMessage, isRecord } from "../util.js";
 import { linesComponent } from "../ui/component.js";
 import type { ApproveLaunch, LaunchOrigin, LaunchPlan, WorkflowApprovalPolicy } from "./approval.js";
 import type { ConsentStore } from "./consent.js";
-import { completeWorkflow, completeWorkflowFailure, deliverWorkflowInBackground, formatWorkflowResult, groupFailedChildren, launchWorkflow, type StartedWorkflow } from "./launch.js";
+import { completeWorkflowFailureInline, completeWorkflowInline, deliverWorkflowInBackground, launchWorkflow, type StartedWorkflow } from "./launch.js";
 import { normalizeArgs, readAbsoluteScript, type WorkflowRunResult } from "./workflow-runner.js";
 import { parseWorkflowScript } from "./parser.js";
 
@@ -31,9 +30,6 @@ const WorkflowToolParameters = Type.Object({
     minItems: 1,
     description: "Resume-only child ids explicitly authorized to rerun after execution-environment drift.",
   })),
-  wait: Type.Optional(Type.Boolean({
-    description: "Almost always omit. Waiting blocks the rest of this turn until the workflow finishes; the user's only recourse is /background or b in /agents, which detaches the run and returns a backgrounded running result - after that, do not poll; the result arrives as a steered message. Prefer background even when later work depends on the result - end the turn and continue when the completion message arrives; do not poll. Set true only for short runs whose result this same turn must consume immediately.",
-  })),
 }, { additionalProperties: false });
 
 type WorkflowToolInput = Static<typeof WorkflowToolParameters>;
@@ -48,7 +44,7 @@ interface WorkflowToolServices {
   resolveSaved: (name: string, cwd: string) => string | undefined;
 }
 
-const DESCRIPTION = `Execute deterministic JavaScript orchestration over subagents. Use workflow when results feed later spawns, when you need phases, pipelines, or resumable control flow, or for more than 16 independent items; a plain subagent fan-out (up to 16) covers independent one-shot tasks. Read the workflow-authoring skill before writing a non-trivial script or diagnosing a replay error; launch and runtime errors also name the exact rule violated.
+const DESCRIPTION = `Execute deterministic JavaScript orchestration over subagents. Use workflow when results feed later spawns, when you need phases, pipelines, or resumable control flow, or for more than about eight independent items; up to that many independent one-shot tasks are just that many subagent calls in one turn. Read the workflow-authoring skill before writing a non-trivial script or diagnosing a replay error; launch and runtime errors also name the exact rule violated.
 
 The script is a module string beginning with a literal header:
 export const meta = { name: 'audit-routes', description: 'Audit routes', phases: [{ title: 'Discover' }, { title: 'Audit' }] }
@@ -59,61 +55,32 @@ return parallel(files.map(file => () => agent('Audit ' + file)))
 
 Globals: agent(prompt, opts?), parallel(thunks), pipeline(items, ...stages), phase(title), log(message), and args. agent opts: model ("provider/model-id", never bare), thinkingLevel, tools, excludeTools, schema, cwd, isolation ('worktree' returns { value, patch, changed }; the patch is never applied automatically), label, phase. Every prompt must be self-contained: the child receives neither the parent conversation nor workflow variables unless interpolated. A failed agent() resolves to null - guard before dereferencing. Scripts must be deterministic: no wall-clock, randomness, or raw Promise concurrency - use parallel/pipeline and pass varying inputs through args. Resume with resumeRunId replays completed calls from the journal; drift on a completed call fails closed with an error naming the childId and the rerunChildIds recovery.
 
-Runs in the background by default; completion arrives as a steered parent message. With wait: true, an under-budget result is JSON shaped as { type: "workflow_result", runId, runDir, status, result }, plus failedChildren when agent() calls failed and warning when persistence degraded; oversized results use the bounded prose envelope. Saved workflows run via script: "@<name>" or /wf-<name>. A resumeRunId still requires exactly one of script or scriptPath.`;
+Every run is background: the call returns as soon as the workflow starts and completion arrives later as a steered parent message, so do not wait or poll - end the turn and continue when the message arrives. (In a host with no interactive UI the call instead blocks and returns the result inline.) Saved workflows run via script: "@<name>" or /wf-<name>. A resumeRunId still requires exactly one of script or scriptPath.`;
 
-/** UI-side summary rendered for the workflow tool row; the model reads content, not this. */
+/**
+ * UI-side launch receipt rendered for the workflow tool row.
+ *
+ * The run is always background, so the row describes the workflow that started;
+ * its outcome arrives as a steered message and is inspectable in /agents.
+ */
 export interface WorkflowToolDetails {
-  status: "running" | "completed";
+  status: "running";
   runId: string;
   runDir: string;
   phases: WorkflowPhase[];
-  resultPreview?: string;
-  resultBytes?: number;
-  failureGroups?: Array<{ count: number; error: string; labels: string[] }>;
-  persistenceWarning?: string;
 }
 
-export function workflowToolDetails(result: WorkflowRunResult): WorkflowToolDetails {
-  const resultJson = result.result === undefined ? undefined : JSON.stringify(result.result);
-  return {
-    status: "completed",
-    runId: result.runId,
-    runDir: result.runDir,
-    phases: (result.meta.phases ?? []).map((phase) => ({ ...phase })),
-    resultPreview: resultJson?.slice(0, 200),
-    resultBytes: resultJson?.length,
-    failureGroups: groupFailedChildren(result.failedChildren),
-    persistenceWarning: result.persistenceWarning,
-  };
-}
-
-/**
- * Compact tool-row summary. The full result JSON travels to the model in the
- * tool result content; rendering it verbatim floods the transcript, so the
- * row shows counts, a bounded preview, grouped failures, and the run dir.
- */
+/** Compact tool-row summary; the model reads the result content, not this. */
 export function workflowSummaryLines(details: WorkflowToolDetails): string[] {
   const safe = (value: string | number): string => sanitizeTerminalText(String(value));
-  const lines: string[] = [];
-  lines.push(`${safe(details.runId)} - ${safe(details.status)}`);
+  const lines = [`${safe(details.runId)} - ${safe(details.status)}`];
   // Details round-trip through the session JSONL, so a resumed session can replay
   // a payload written by a different version of this file. Unlike the subagent
   // rows these lines are built eagerly in renderResult, which pi wraps in its own
   // try/catch, so a throw degrades to pi's fallback rather than killing the TUI -
-  // checking the two collections is enough to keep the real summary instead.
+  // checking the one collection is enough to keep the real summary instead.
   const phases = Array.isArray(details.phases) ? details.phases : [];
   if (phases.length > 0) lines.push(`phases: ${phases.map((phase) => safe(phase.title)).join(", ")}`);
-  if (typeof details.resultPreview === "string") {
-    const truncated = (details.resultBytes ?? 0) > details.resultPreview.length;
-    const notice = truncated ? ` [preview of ${safe(details.resultBytes ?? 0)} bytes]` : "";
-    lines.push(`result: ${safe(details.resultPreview)}${notice}`);
-  }
-  for (const group of Array.isArray(details.failureGroups) ? details.failureGroups : []) {
-    const safeLabels = group.labels.map(safe);
-    const labels = `${safeLabels.join(", ")}${group.count > safeLabels.length ? ", ..." : ""}`;
-    lines.push(`${safe(group.count)} failed (${labels}): ${safe(group.error)}`);
-  }
-  if (details.persistenceWarning) lines.push(`warning: ${safe(details.persistenceWarning)}`);
   lines.push(`run dir: ${safe(details.runDir)}`);
   return lines;
 }
@@ -145,89 +112,44 @@ export function registerWorkflowTool(pi: ExtensionAPI, selfPath: string, service
         thinkingLevel: pi.getThinkingLevel() as ThinkingLevel,
         selfPath,
       };
-      const waitController = params.wait ? new AbortController() : undefined;
-      const unbindWaitSignal = waitController ? bindAbort(signal, () => waitController.abort()) : () => {};
-      let returned = false;
-      let launched: Awaited<ReturnType<typeof launchWorkflow>>;
-      try {
-        launched = await launchWorkflow(
-          pi,
-          parent,
-          // Only a waiting workflow is bound to this turn's signal. A background
-          // workflow outlives the turn, so a later Esc must not abort it - stop it
-          // from /agents instead.
-          {
-            plan,
-            resumeRunId: params.resumeRunId,
-            rerunChildIds: params.rerunChildIds,
-            signal: waitController?.signal,
-            onLog: (message) => {
-              if (!returned) onUpdate?.({ content: [{ type: "text", text: message }], details: undefined });
-            },
-          },
-          { approve: services.approve, ctx, deps: { consent: services.consent, policy: services.approvalPolicy() } },
-        );
-      } catch (error) {
-        unbindWaitSignal();
-        throw error;
-      }
-      const { started, execution } = launched;
+      // Headless hosts (print/json mode) end the session when this turn ends,
+      // which aborts the run - there is no later turn to steer a result into.
+      // Only there does the call wait inline; only there is the turn's abort
+      // signal bound, and only there do script log() lines stream to the tool
+      // row (a background call has returned before any log can fire).
+      const headless = !ctx.hasUI;
+      const { started, execution } = await launchWorkflow(
+        pi,
+        parent,
+        {
+          plan,
+          resumeRunId: params.resumeRunId,
+          rerunChildIds: params.rerunChildIds,
+          ...(headless ? {
+            signal,
+            onLog: (message: string) => onUpdate?.({ content: [{ type: "text", text: message }], details: undefined }),
+          } : {}),
+        },
+        { approve: services.approve, ctx, deps: { consent: services.consent, policy: services.approvalPolicy() } },
+      );
       try {
         services.observeRun?.(started, ctx);
       } catch (error) {
         reportDiagnostic(`[subagent-workflow] workflow observer failed: ${sanitizeTerminalText(errorMessage(error))}`);
       }
-      if (params.wait) {
-        const sessionId = ctx.sessionManager.getSessionId();
-        let outcome: "waiting" | "completed" | "detached" = "waiting";
-        const claim = (next: "completed" | "detached"): boolean => {
-          if (outcome !== "waiting") return false;
-          outcome = next;
-          return true;
-        };
-        let requestDetach!: () => void;
-        const detachRequested = new Promise<void>((resolve) => { requestDetach = resolve; });
-        subagentRunner.registerWaitedRun(started.runId, sessionId, () => {
-          if (waitController!.signal.aborted || !claim("detached")) return false;
-          unbindWaitSignal();
-          requestDetach();
-          return true;
-        });
-        let settled: { ok: WorkflowRunResult } | { err: unknown } | undefined;
+      const sessionId = ctx.sessionManager.getSessionId();
+      if (headless) {
+        let result: WorkflowRunResult;
         try {
-          settled = await Promise.race([
-            execution.then(
-              (result) => claim("completed") ? { ok: result } : undefined,
-              (error) => claim("completed") ? { err: error } : undefined,
-            ),
-            detachRequested.then(() => undefined),
-          ]);
-        } finally {
-          subagentRunner.unregisterWaitedRun(started.runId);
-          unbindWaitSignal();
+          result = await execution;
+        } catch (error) {
+          throw completeWorkflowFailureInline(error, sessionId);
         }
-        if (settled === undefined) {
-          returned = true;
-          deliverWorkflowInBackground(pi, execution, sessionId);
-          return {
-            content: [{ type: "text", text: JSON.stringify({
-              type: "workflow_backgrounded",
-              runId: started.runId,
-              runDir: started.runDir,
-              status: "running",
-              note: "The user moved this workflow to the background. Do not wait or poll; the result will arrive as a steered message. Continue other work or end the turn.",
-            }) }],
-            details: { status: "running", runId: started.runId, runDir: started.runDir, phases: started.phases },
-          };
-        }
-        if ("err" in settled) throw completeWorkflowFailure(settled.err, sessionId, (message) => new Error(message));
-        return completeWorkflow(pi, settled.ok, sessionId, () => ({
-          content: [{ type: "text" as const, text: formatWorkflowResult(settled.ok) }],
-          details: workflowToolDetails(settled.ok),
-        }));
+        return { content: [{ type: "text", text: completeWorkflowInline(pi, result, sessionId) }], details: undefined };
       }
-      deliverWorkflowInBackground(pi, execution, ctx.sessionManager.getSessionId());
-      returned = true;
+      // A background workflow outlives the turn: a later Esc must not abort
+      // it - stop it from /agents instead.
+      deliverWorkflowInBackground(pi, execution, sessionId);
       return {
         content: [{ type: "text", text: JSON.stringify({ runId: started.runId, runDir: started.runDir, phases: started.phases, status: "running" }) }],
         details: { status: "running", runId: started.runId, runDir: started.runDir, phases: started.phases },

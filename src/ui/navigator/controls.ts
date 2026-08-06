@@ -42,8 +42,8 @@ export function passesFilter(status: SubagentStatus, filter: FilterMode): boolea
 }
 
 /**
- * Children in navigation order: workflow runs group by phase order then start
- * time; subagent/fan-out runs keep their spawn order. Filtered by status.
+ * Children in navigation order: workflow runs group by phase order, then
+ * alphabetically. Filtered by status.
  */
 export function orderedChildren(detail: RunDetail, filter: FilterMode): ChildRow[] {
   const filtered = detail.children.filter((child) => passesFilter(child.status, filter));
@@ -63,7 +63,6 @@ export function orderedChildren(detail: RunDetail, filter: FilterMode): ChildRow
 
 export interface RunActionAvailability {
   canStop: boolean;
-  canBackground: boolean;
   canSave: boolean;
 }
 
@@ -72,12 +71,10 @@ export function runActionAvailability(
   detail: RunDetail,
   runIsLive: boolean,
   handleStatuses: readonly SubagentStatus[],
-  waited: boolean,
   saveAvailable: boolean,
 ): RunActionAvailability {
   return {
     canStop: runIsLive || handleStatuses.some((status) => status === "running" || status === "pending"),
-    canBackground: waited,
     canSave: saveAvailable && !detail.corrupt && detail.kind === "workflow" && detail.status === "completed" && detail.hasScript,
   };
 }
@@ -90,7 +87,6 @@ type NavAction =
   | { type: "back" }
   | { type: "close" }
   | { type: "stop" }
-  | { type: "background" }
   | { type: "filter" }
   | { type: "save" }
   | { type: "steer" }
@@ -125,8 +121,6 @@ export function keyToAction(keyId: string | undefined, level: Level): NavAction 
       return { type: "back" };
     case "x":
       return { type: "stop" };
-    case "b":
-      return level === "agent" ? { type: "none" } : { type: "background" };
     case "f":
       return level === "run" ? { type: "filter" } : { type: "none" };
     case "s":
@@ -144,8 +138,6 @@ interface FooterState {
   filter?: FilterMode;
   /** Whether the selected run or agent can currently be stopped. */
   canStop?: boolean;
-  /** Whether the selected run is blocking a wait-mode tool call. */
-  canBackground?: boolean;
   /** Whether the selected workflow can be saved. */
   canSave?: boolean;
   /** Agent-detail only: whether the steering composer is available. */
@@ -163,13 +155,11 @@ export function footerHint(state: FooterState, theme: ThemeLike): string {
     parts.push("enter open", "esc close");
     if (state.canCycle) parts.push("tab next live");
     if (state.canStop) parts.push(state.stopArmed ? "x again to STOP" : "x stop");
-    if (state.canBackground) parts.push("b background");
     if (state.canSave) parts.push("s save");
   } else if (state.level === "run") {
     parts.push("enter open", "esc back", `f filter: ${state.filter ?? "all"}`);
     if (state.canCycle) parts.push("tab next live");
     if (state.canStop) parts.push(state.stopArmed ? "x again to STOP" : "x stop");
-    if (state.canBackground) parts.push("b background");
     if (state.canSave) parts.push("s save");
   } else {
     parts.length = 0;

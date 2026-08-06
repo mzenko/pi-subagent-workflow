@@ -62,7 +62,7 @@ const fixtures: Fixture[] = [
     expectedDiagnostics: [],
     expectedOwner: "missing",
     expectedSummary: {
-      kind: "workflow", createdAt: 1_782_867_600_000, label: "workflow", fanout: false,
+      kind: "workflow", createdAt: 1_782_867_600_000, label: "workflow",
       status: "completed", done: 1, total: 1, completed: 1, failed: 0, aborted: 0, tokens: 15, corrupt: false, reconciled: false,
     },
     savedEligible: true,
@@ -76,7 +76,7 @@ const fixtures: Fixture[] = [
     expectedDiagnostics: [],
     expectedOwner: "valid",
     expectedSummary: {
-      kind: "subagent", createdAt: 1_782_871_200_000, label: "Runner", fanout: false,
+      kind: "subagent", createdAt: 1_782_871_200_000, label: "Runner",
       status: "running", done: 0, total: 1, completed: 0, failed: 0, aborted: 0, tokens: 6, corrupt: false, reconciled: false,
     },
     savedEligible: false,
@@ -95,7 +95,7 @@ const fixtures: Fixture[] = [
     expectedEvents: 1,
     expectedOwner: "missing",
     expectedSummary: {
-      kind: "workflow", createdAt: 1_782_874_800_000, label: "workflow", fanout: false,
+      kind: "workflow", createdAt: 1_782_874_800_000, label: "workflow",
       status: "aborted", done: 1, total: 1, completed: 1, failed: 0, aborted: 0, tokens: 5, corrupt: false, reconciled: true,
     },
     savedEligible: false,
@@ -107,7 +107,7 @@ const fixtures: Fixture[] = [
     expectedDiagnostics: [{ file: "run.json" }],
     expectedOwner: "missing",
     expectedSummary: {
-      kind: "subagent", createdAt: 1_782_864_000_000, label: "unreadable run", fanout: false,
+      kind: "subagent", createdAt: 1_782_864_000_000, label: "unreadable run",
       status: "failed", done: 0, total: 0, completed: 0, failed: 0, aborted: 0, tokens: 0, corrupt: true, reconciled: false,
     },
     savedEligible: false,
@@ -133,7 +133,7 @@ const fixtures: Fixture[] = [
     expectedEvents: 3,
     expectedOwner: "missing",
     expectedSummary: {
-      kind: "workflow", createdAt: 1_782_882_000_000, label: "workflow", fanout: false,
+      kind: "workflow", createdAt: 1_782_882_000_000, label: "workflow",
       status: "completed", done: 1, total: 1, completed: 1, failed: 0, aborted: 0, tokens: 3, corrupt: false, reconciled: false,
     },
     savedEligible: true,
@@ -146,7 +146,7 @@ const fixtures: Fixture[] = [
     expectedPending: true,
     expectedOwner: "missing",
     expectedSummary: {
-      kind: "subagent", createdAt: 1_782_864_000_000, label: "quarantined - crashed mid-resume", fanout: false,
+      kind: "subagent", createdAt: 1_782_864_000_000, label: "quarantined - crashed mid-resume",
       status: "failed", done: 0, total: 0, completed: 0, failed: 0, aborted: 0, tokens: 0, corrupt: true, reconciled: false,
     },
     savedEligible: false,
@@ -159,7 +159,7 @@ const fixtures: Fixture[] = [
     expectedDiagnostics: [],
     expectedOwner: "valid",
     expectedSummary: {
-      kind: "workflow", createdAt: 1_782_889_200_000, label: "workflow", fanout: false,
+      kind: "workflow", createdAt: 1_782_889_200_000, label: "workflow",
       status: "aborted", done: 1, total: 1, completed: 0, failed: 0, aborted: 1, tokens: 6, corrupt: false, reconciled: true,
     },
     savedEligible: false,
@@ -172,7 +172,7 @@ const fixtures: Fixture[] = [
     expectedDiagnostics: [{ file: "owner.json" }],
     expectedOwner: "malformed",
     expectedSummary: {
-      kind: "workflow", createdAt: 1_782_892_800_000, label: "workflow", fanout: false,
+      kind: "workflow", createdAt: 1_782_892_800_000, label: "workflow",
       status: "running", done: 0, total: 1, completed: 0, failed: 0, aborted: 0, tokens: 6, corrupt: false, reconciled: false,
     },
     savedEligible: false,

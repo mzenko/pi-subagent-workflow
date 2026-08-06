@@ -342,7 +342,7 @@ export function startParsedWorkflow(
       if (agentAttemptCount > agentCap) {
         throw new Error(`Workflow agent lifetime cap is ${agentCap}; attempted call count ${agentAttemptCount}`);
       }
-      const handle = runner.spawnRun([spec], parent, { runId, store })[0]!;
+      const handle = runner.spawnRun(spec, parent, { runId, store });
       liveHandles.add(handle);
       // A stop can arrive between the pre-spawn abort check and handle
       // registration. Do not leave that child outside the earlier snapshot.

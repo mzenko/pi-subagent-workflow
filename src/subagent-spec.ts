@@ -19,11 +19,9 @@ export const SubagentPromptSchema = Type.String({
 
 export const MODEL_DESCRIPTION = 'Fully qualified "provider/model-id", e.g. "openai-codex/gpt-5.6-luna" - the provider prefix is required because several providers can be configured. Omit to inherit the parent conversation\'s provider and model.';
 
-/** Options shared by direct subagent specs and workflow agent() calls. */
+/** Options shared by the subagent tool and workflow agent() calls. */
 export const PublicSubagentOptionFields = {
-  // Fan-out entries keep invalid strings representable so one bad override can
-  // fail as its own child without schema validation rejecting valid siblings.
-  model: Type.Optional(Type.String({ description: MODEL_DESCRIPTION })),
+  model: Type.Optional(Type.String({ minLength: 1, description: MODEL_DESCRIPTION })),
   thinkingLevel: Type.Optional(ThinkingLevelSchema),
   tools: Type.Optional(Type.Array(Type.String(), {
     description: "Tool-name allowlist. Normally omit to use tools discovered for the child cwd; requesting an unavailable tool fails that child.",
@@ -43,18 +41,9 @@ export const PublicSubagentOptionFields = {
   })),
 };
 
-/** Runtime contract for one direct subagent tool spec. */
-export const PublicSubagentSpecSchema = Type.Object({
-  prompt: SubagentPromptSchema,
-  ...PublicSubagentOptionFields,
-}, { additionalProperties: false });
-
 /** Runtime contract for workflow agent(prompt, opts). */
 const WorkflowAgentOptionsSchema = Type.Object({
   ...PublicSubagentOptionFields,
-  // A workflow agent() call represents one child, so an empty override can be
-  // rejected at the boundary rather than preserved for fan-out isolation.
-  model: Type.Optional(Type.String({ minLength: 1, description: MODEL_DESCRIPTION })),
   phase: Type.Optional(Type.String()),
 }, { additionalProperties: false });
 

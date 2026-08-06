@@ -83,13 +83,13 @@ test("navigator follow-up resolves the qualified child, preflights, spawns, and 
     sendUserMessage: (message: string) => { delivered.push(message); },
   } as unknown as ExtensionAPI;
   const runner = {
-    spawnRun: (specs: ResolvedFollowUpSpec[], parent: ParentContext, options?: { directDelivery?: boolean }) => {
+    spawnRun: (spec: ResolvedFollowUpSpec, parent: ParentContext, options?: { directDelivery?: boolean }) => {
       order.push("spawn");
       expect(parent.thinkingLevel).toBe("high");
       expect(options?.directDelivery).toBe(true);
-      spawned.push(...specs);
+      spawned.push(spec);
       targetStore = new RunStore(targetRunId, cwd, "parent", undefined, { rootDir: root, directDelivery: true });
-      targetStore.addChild(targetChildId, specs[0]!.spec, specs[0]!.followUpOf);
+      targetStore.addChild(targetChildId, spec.spec, spec.followUpOf);
       const sessionFile = join(targetStore.sessionsDir, `${targetChildId}.jsonl`);
       writeFileSync(sessionFile, "follow-up transcript\n");
       targetStore.resolveChild(targetChildId, { ...resolved, label: "follow-up child", cwd }, sessionFile);
@@ -109,7 +109,7 @@ test("navigator follow-up resolves the qualified child, preflights, spawns, and 
         runId: targetRunId,
         runDir: targetStore.runDir,
         generation: 1,
-        spec: specs[0]!.spec,
+        spec: spec.spec,
         resolved: result.resolved,
         status: "completed",
         startedAt: Date.now(),
@@ -118,7 +118,7 @@ test("navigator follow-up resolves the qualified child, preflights, spawns, and 
         steer: async () => {},
         subscribe: () => () => {},
       };
-      return [handle];
+      return handle;
     },
     markDelivered: (runId: string) => {
       marked.push(runId);
@@ -222,7 +222,7 @@ test("navigator follow-up reports a started run even when post-spawn widget trac
     subscribe: () => () => {},
   };
   const runner = {
-    spawnRun: () => [handle],
+    spawnRun: () => handle,
     markDelivered: (runId: string) => { marked.push(runId); return undefined; },
   } as unknown as SubagentRunner;
   const pi = {
@@ -262,7 +262,7 @@ test("navigator follow-up surfaces resolver refusals before preflight or spawn",
   const service = createNavigatorFollowUp({ getThinkingLevel: () => "off" } as unknown as ExtensionAPI, "/extension.ts", {
     resolveFollowUp: () => { throw new Error("source session closure is not confirmed; wait and retry"); },
     preflight: () => { preflighted = true; return {} as never; },
-    runner: { spawnRun: () => { spawned = true; return []; } } as unknown as SubagentRunner,
+    runner: { spawnRun: () => { spawned = true; throw new Error("unreachable"); } } as unknown as SubagentRunner,
   });
 
   expect(() => service.send("run", "child", "continue", navigatorContext("/tmp")))

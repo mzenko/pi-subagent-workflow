@@ -12,6 +12,7 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import type { ThemeLike } from "./format.js";
 import { sanitizeTerminalText } from "./sanitize.js";
+import { suppressInlineImages } from "./suppress-inline-images.js";
 
 /** Total overlay rows (header + body window + footer). Small enough for short terminals. */
 export const OVERLAY_HEIGHT = 22;
@@ -52,11 +53,17 @@ export function scriptOverlayLines(script: string, scrollTop: number, height: nu
 }
 
 /** Factory for ctx.ui.custom: a focusable overlay that scrolls the script and closes on Esc/q. */
-export function scriptOverlayFactory(script: string): (tui: TUI, theme: Theme, keybindings: unknown, done: (value: undefined) => void) => Component & { focused: boolean } {
+export function scriptOverlayFactory(script: string): (tui: TUI, theme: Theme, keybindings: unknown, done: (value: undefined) => void) => Component & { focused: boolean; dispose(): void } {
   const total = script.replace(/\n+$/, "").split("\n").length;
   const view = bodyHeight(OVERLAY_HEIGHT);
   return (tui, theme, _keybindings, done) => {
     let scrollTop = 0;
+    // Inline images paint over overlays (see suppress-inline-images.ts).
+    const restoreImages = suppressInlineImages(tui);
+    const close = (): void => {
+      restoreImages();
+      done(undefined);
+    };
     const move = (delta: number): void => {
       scrollTop = clampScroll(scrollTop + delta, total, view);
       tui.requestRender();
@@ -65,7 +72,7 @@ export function scriptOverlayFactory(script: string): (tui: TUI, theme: Theme, k
       focused: true,
       render: (width: number) => scriptOverlayLines(script, scrollTop, OVERLAY_HEIGHT, width, theme),
       handleInput: (data: string) => {
-        if (matchesKey(data, Key.escape) || data === "q") return done(undefined);
+        if (matchesKey(data, Key.escape) || data === "q") return close();
         if (matchesKey(data, Key.up) || data === "k") return move(-1);
         if (matchesKey(data, Key.down) || data === "j") return move(1);
         if (matchesKey(data, Key.pageUp)) return move(-view);
@@ -74,6 +81,9 @@ export function scriptOverlayFactory(script: string): (tui: TUI, theme: Theme, k
         if (matchesKey(data, Key.end)) return move(total);
       },
       invalidate: () => {},
+      // Host teardown paths close overlays without resolving done(); the
+      // disposer is idempotent, so covering both costs nothing.
+      dispose: () => restoreImages(),
     };
   };
 }

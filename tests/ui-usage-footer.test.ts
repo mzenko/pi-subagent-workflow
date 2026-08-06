@@ -73,7 +73,7 @@ class FakeRunner {
     return () => { this.childListeners.delete(listener); };
   }
 
-  spawn(run: Omit<SpawnedRun, "handles"> & { handles: readonly SubagentHandle[] }): void {
+  spawn(run: Omit<SpawnedRun, "handle"> & { handles: readonly SubagentHandle[] }): void {
     for (const handle of run.handles) {
       if (handle instanceof FakeHandle) {
         handle.publish = (event) => {
@@ -81,8 +81,8 @@ class FakeRunner {
           for (const listener of this.childListeners) listener(observed);
         };
       }
+      for (const listener of this.listeners) listener({ runId: run.runId, runDir: run.runDir, parentSessionId: run.parentSessionId, handle });
     }
-    for (const listener of this.listeners) listener(run);
   }
 }
 

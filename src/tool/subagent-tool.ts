@@ -3,14 +3,12 @@ import { isAbsolute, join } from "node:path";
 import { getAgentDir, type ExtensionAPI, type AgentToolResult, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import {
-  MODEL_DESCRIPTION,
   PublicSubagentOptionFields,
-  PublicSubagentSpecSchema,
   SubagentPromptSchema,
   assertSchemaValue,
 } from "../subagent-spec.js";
-import type { SubagentResult, SubagentSpec, SubagentStatus, ThinkingLevel } from "../types.js";
-import { submittedSpec, unknownModelError, type ChildSpawnSpec, type ParentContext, type ResolvedFollowUpSpec } from "../runner/child.js";
+import type { SubagentHandle, SubagentResult, SubagentSpec, SubagentStatus, ThinkingLevel } from "../types.js";
+import { resolveModel, submittedSpec, unknownModelError, type ChildSpawnSpec, type ParentContext, type ResolvedFollowUpSpec } from "../runner/child.js";
 import { runOwnerIsLive } from "../store/lease.js";
 import {
   DELIVERY_PROTOCOL_VERSION,
@@ -22,46 +20,28 @@ import { encodeCwd, sumUsage } from "../store/run-store.js";
 import { jsonObject, readRunSnapshot, type RunSnapshot } from "../store/run-snapshot.js";
 import { hasSessionClosedMarker } from "../store/session-closed-marker.js";
 import { subagentRunner, type SubagentRunner } from "../runner/runner.js";
-import {
-  SubagentRowTracker,
-  initialDetails,
-  renderCallHeader,
-  renderSubagentResult,
-  type SubagentDetails,
-} from "../ui/tool-render.js";
+import { initialDetails, renderCallHeader, renderSubagentResult, type SubagentDetails } from "../ui/tool-render.js";
 import { appendEntrySafely } from "../ui/entry-markers.js";
-import { buildDeliveryEnvelope, DELIVERY_ENVELOPE_BUDGET } from "../ui/delivery-envelope.js";
+import { buildDeliveryEnvelope } from "../ui/delivery-envelope.js";
 import { chunkDeliveryText, formatFailureText, safeDeliveryValue, stringifyDeliveryJson } from "../ui/delivery-safe.js";
 import type { SubagentStatusWidget } from "../ui/status-widget.js";
 import { reportDiagnostic } from "../diagnostics.js";
 import { bindAbort, childLabel, errorMessage } from "../util.js";
-import { groupFailedChildren } from "../workflow/launch.js";
 
 export const SubagentToolParameters = Type.Object({
   prompt: Type.Optional(SubagentPromptSchema),
   ...PublicSubagentOptionFields,
-  // Top-level calls represent one child. Fan-out specs intentionally keep
-  // empty model strings representable so that child can fail independently.
-  model: Type.Optional(Type.String({ minLength: 1, description: MODEL_DESCRIPTION })),
-  specs: Type.Optional(Type.Array(PublicSubagentSpecSchema, {
-    minItems: 1,
-    maxItems: 16,
-    description: "Independent child specs. Mutually exclusive with prompt and top-level child options. The process-wide semaphore already limits actual concurrency.",
-  })),
   followUp: Type.Optional(Type.Object({
     id: Type.String({ minLength: 1 }),
     prompt: Type.String({ minLength: 1 }),
   }, { additionalProperties: false })),
-  wait: Type.Optional(Type.Boolean({
-    description: "Almost always omit. Waiting blocks the rest of this turn until every child finishes; the user's only recourse is /background or b in /agents, which detaches the run and returns a backgrounded running result - after that, do not poll; the result arrives as a steered message. Prefer background even when later work depends on the result - end the turn and continue when the completion message arrives; do not poll. Set true only for short runs whose result this same turn must consume immediately.",
-  })),
 }, { additionalProperties: false });
 export type SubagentToolInput = Static<typeof SubagentToolParameters>;
 
-const PER_SPEC_FIELDS = Object.keys(PublicSubagentOptionFields) as Array<keyof typeof PublicSubagentOptionFields>;
+const OPTION_FIELDS = Object.keys(PublicSubagentOptionFields) as Array<keyof typeof PublicSubagentOptionFields>;
 
 export type ValidatedSubagentInput =
-  | { type: "spawn"; specs: SubagentSpec[] }
+  | { type: "spawn"; spec: SubagentSpec }
   | { type: "followUp"; id: string; prompt: string; label?: string };
 
 /**
@@ -73,22 +53,13 @@ export type ValidatedSubagentInput =
  * the exception: it is presentation only, and a follow-up turn usually has a
  * different purpose than the child it forks from, so it is allowed to say so.
  */
-const FOLLOW_UP_CONFIG_FIELDS = PER_SPEC_FIELDS.filter((field) => field !== "label");
+const FOLLOW_UP_CONFIG_FIELDS = OPTION_FIELDS.filter((field) => field !== "label");
 
 export function validateSubagentInput(params: SubagentToolInput): ValidatedSubagentInput {
   assertSchemaValue(SubagentToolParameters, params, "subagent input");
-  const single = params.prompt !== undefined;
-  const batch = params.specs !== undefined;
+  const prompt = params.prompt !== undefined;
   const followUp = params.followUp !== undefined;
-  if (Number(single) + Number(batch) + Number(followUp) !== 1) {
-    throw new Error("Provide exactly one of prompt, specs, or followUp");
-  }
-  if (batch) {
-    // Top-level per-spec fields are silently ignored when specs is given; a
-    // caller who sets them at the top level meant them per child. Fail loudly.
-    const stray = PER_SPEC_FIELDS.find((field) => params[field] !== undefined);
-    if (stray) throw new Error(`With specs, set ${stray} inside each specs entry, not at the top level`);
-  }
+  if (prompt === followUp) throw new Error("Provide exactly one of prompt or followUp");
   if (followUp) {
     const stray = FOLLOW_UP_CONFIG_FIELDS.find((field) => params[field] !== undefined);
     if (stray) {
@@ -97,12 +68,16 @@ export function validateSubagentInput(params: SubagentToolInput): ValidatedSubag
     if (!params.followUp!.prompt.trim()) throw new Error("Subagent prompt must not be empty");
     return { type: "followUp", id: params.followUp!.id, prompt: params.followUp!.prompt, label: params.label };
   }
-  const specs: SubagentSpec[] = batch ? (params.specs as SubagentSpec[]) : [{ prompt: params.prompt!, model: params.model,
-    thinkingLevel: params.thinkingLevel as ThinkingLevel | undefined, tools: params.tools, excludeTools: params.excludeTools,
-    schema: params.schema, cwd: params.cwd, label: params.label, isolation: params.isolation }];
   // TypeBox's minLength does not catch whitespace-only prompts.
-  for (const spec of specs) if (!spec.prompt.trim()) throw new Error("Subagent prompt must not be empty");
-  return { type: "spawn", specs };
+  if (!params.prompt!.trim()) throw new Error("Subagent prompt must not be empty");
+  return {
+    type: "spawn",
+    spec: {
+      prompt: params.prompt!, model: params.model, thinkingLevel: params.thinkingLevel as ThinkingLevel | undefined,
+      tools: params.tools, excludeTools: params.excludeTools, schema: params.schema, cwd: params.cwd,
+      label: params.label, isolation: params.isolation,
+    },
+  };
 }
 
 interface FollowUpCandidate {
@@ -324,225 +299,118 @@ export function registerSubagentTool(pi: ExtensionAPI, selfPath: string, widget?
   runner: SubagentRunner = subagentRunner, resolveFollowUp: FollowUpResolver = resolveFollowUpSpec): void {
   const tool: ToolDefinition<typeof SubagentToolParameters, SubagentDetails | undefined> = {
     name: "subagent", label: "Subagent", parameters: SubagentToolParameters,
-    description: "Spawn one ad-hoc child or fan out up to 16 independent children; when results must feed later spawns or there are more than 16 items, use workflow instead. Each child starts cold with only its self-contained prompt and inherits the parent's provider/model and thinking level unless overridden ('provider/model-id', never a bare model name). Add schema (JSON Schema) for validated structured output. Use isolation: 'worktree' for parallel edits; changes return as a patch, never applied automatically. Do not pre-batch to control concurrency; the global semaphore already paces all spawns. Background delivery is the default; the result arrives as a steered message. With wait: true, an under-budget result is JSON shaped as { type: \"subagent_results\", runId, runDir, results }, plus warning when persistence degraded; oversized results use the bounded prose envelope. followUp: { id, prompt } forks a completed child's persisted session into a new child and run; it inherits that child's model, thinking level, tools, schema, cwd, and isolation, so none of those may be set at the top level - label is the one exception and should name the new turn. Compose each child for the task at hand; recurring task shapes belong in skills, not fixed agent personas.",
-    async execute(_toolCallId, params, signal, onUpdate, ctx): Promise<Detailed> {
+    description: "Spawn one ad-hoc child. Each child starts cold with only its self-contained prompt and inherits the parent's provider/model and thinking level unless overridden ('provider/model-id', never a bare model name). Add schema (JSON Schema) for validated structured output. Use isolation: 'worktree' for parallel edits; changes return as a patch, never applied automatically. For several independent children, call this tool several times in the same turn - up to about eight; beyond that, or when results must feed later spawns, or you need phases, pipelines, or resumable control flow, use workflow instead. The global semaphore paces all spawns, so never batch to control concurrency. Every run is background: the call returns as soon as the child starts and its result arrives later as a steered message, so do not wait or poll - end the turn and continue when the message arrives. (In a host with no interactive UI the call instead blocks and returns the result inline.) followUp: { id, prompt } forks a completed child's persisted session into a new child and run; it inherits that child's model, thinking level, tools, schema, cwd, and isolation, so none of those may be set at the top level - label is the one exception and should name the new turn. Compose each child for the task at hand; recurring task shapes belong in skills, not fixed agent personas.",
+    async execute(_toolCallId, params, signal, _onUpdate, ctx): Promise<Detailed> {
       let input: ValidatedSubagentInput;
       try { input = validateSubagentInput(params); } catch (error) { throw new Error(errorMessage(error)); }
-      const spawnSpecs: ChildSpawnSpec[] = input.type === "followUp"
-        ? [withFollowUpLabel(resolveFollowUp(input.id, input.prompt, ctx.cwd), input.label)]
-        : input.specs;
-      const specs = spawnSpecs.map(submittedSpec);
-      // A call whose every child is doomed by an unknown model fails fast with
-      // a suggestion instead of spawning. A mixed fan-out still spawns: one bad
-      // spec must not kill valid siblings (their entries fail individually,
-      // carrying the same suggestion), per the batch-isolation contract.
-      const modelProblems = specs
-        .map((spec) => spec.model === undefined ? undefined : unknownModelError(spec.model, ctx.modelRegistry))
-        .filter((problem): problem is string => problem !== undefined);
-      if (modelProblems.length === specs.length) {
-        throw new Error([...new Set(modelProblems)].join(" "));
-      }
+      const spawnSpec: ChildSpawnSpec = input.type === "followUp"
+        ? withFollowUpLabel(resolveFollowUp(input.id, input.prompt, ctx.cwd), input.label)
+        : input.spec;
+      const spec = submittedSpec(spawnSpec);
+      // A child doomed by an unknown model fails fast with a suggestion instead
+      // of spawning.
+      const modelProblem = spec.model === undefined ? undefined : unknownModelError(spec.model, ctx.modelRegistry);
+      if (modelProblem) throw new Error(modelProblem);
       const parent: ParentContext = { ctx, thinkingLevel: pi.getThinkingLevel() as ThinkingLevel, selfPath };
-      const handles = runner.spawnRun(spawnSpecs, parent);
-      const runId = handles[0]!.runId;
-      const runDir = handles[0]!.runDir;
-      const fanout = specs.length > 1;
+      // The receipt's model cell cannot come from the handle - handle.resolved
+      // is filled in asynchronously after admission - so resolve it here. This
+      // duplicates the child's own resolution but is pure and cheap; a spec
+      // that resolves nothing (no parent model) just leaves the cell empty
+      // rather than failing an otherwise-valid spawn.
+      let display: { modelId?: string; thinking?: ThinkingLevel } = {};
+      try {
+        const resolved = resolveModel(spec, ctx, parent.thinkingLevel);
+        display = { modelId: resolved.model.id, thinking: resolved.thinking };
+      } catch { /* the child will fail (or not) on its own terms */ }
+      const handle = runner.spawnRun(spawnSpec, parent);
+      const { runId, runDir } = handle;
       appendEntrySafely(pi, "subagent-workflow:run-started", {
         runId,
         runDir,
-        childIds: handles.map((handle) => handle.id),
-        labels: specs.map((spec) => spec.label ?? childLabel(spec)),
+        childIds: [handle.id],
+        labels: [spec.label ?? childLabel(spec)],
       });
       try {
-        widget?.track(runId, handles, fanout, ctx);
+        widget?.track(runId, handle, ctx);
       } catch (error) {
         // The status widget is observational. Delivery and runner cleanup must
         // remain wired even if a host UI implementation rejects the widget.
         reportDiagnostic(`[subagent-workflow] status widget failed: ${errorMessage(error)}`);
       }
-      if (params.wait) {
-        // Only a waiting call is bound to this turn's signal: if the user
-        // interrupts while we block on the result, cancel the children.
-        // Background children deliberately outlive the spawning turn, so they
-        // are NOT wired to it (a later Esc must not kill promised work).
-        const onAbort = () => { for (const handle of handles) void handle.abort(); };
-        const unbindAbort = bindAbort(signal, onAbort);
-        const tracker = ctx.hasUI ? new SubagentRowTracker(fanout) : undefined;
-        const stopStream = tracker ? streamRows(onUpdate, tracker, handles) : undefined;
-        const sessionId = ctx.sessionManager.getSessionId();
-        let outcome: "waiting" | "completed" | "detached" = "waiting";
-        const claim = (next: "completed" | "detached"): boolean => {
-          if (outcome !== "waiting") return false;
-          outcome = next;
-          return true;
-        };
-        let requestDetach!: () => void;
-        const detachRequested = new Promise<void>((resolve) => { requestDetach = resolve; });
-        runner.registerWaitedRun(runId, sessionId, () => {
-          if (signal?.aborted || !claim("detached")) return false;
-          unbindAbort();
-          stopStream?.();
-          requestDetach();
-          return true;
-        });
-        const allResults = Promise.all(handles.map((handle) => handle.result));
+      const sessionId = ctx.sessionManager.getSessionId();
+      if (!ctx.hasUI) {
+        // Headless hosts (print/json mode) end the session when this turn
+        // ends, which disposes the child - there is no later turn to steer a
+        // result into. Waiting inline is the only way the work can complete.
+        // Only this waiting call binds the turn's abort signal.
+        const unbindAbort = bindAbort(signal, () => { void handle.abort(); });
         try {
-          const settled = await Promise.race([
-            allResults.then((results) => claim("completed") ? { results } : undefined),
-            detachRequested.then(() => undefined),
-          ]);
-          if (settled) {
-            stopStream?.();
-            return fenceDirectlyDeliveredRun(pi, runner, runId, runDir, handles, settled.results, sessionId, (degraded) => {
-              const text = formatWaitResult(runId, runDir, settled.results, degraded);
-              return detailedResult(text, tracker?.snapshot(handles));
-            });
-          }
+          const result = await handle.result;
+          return fenceDirectlyDeliveredRun(pi, runner, handle, result, sessionId, (degraded) =>
+            detailedResult(formatDelivery(runId, runDir, result, degraded), undefined));
         } finally {
-          runner.unregisterWaitedRun(runId);
           unbindAbort();
         }
-        void allResults.then((results) => {
-          queueCompletedRun(pi, runner, runId, runDir, handles, results, sessionId);
-        }).catch((error) => {
-          reportDiagnostic(`[subagent-workflow] background delivery failed: ${errorMessage(error)}`);
-        });
-        return detachedResult(runId, runDir, tracker?.snapshot(handles));
       }
-      const launched = ctx.hasUI ? initialDetails(specs, handles, fanout) : undefined;
-      void Promise.all(handles.map((handle) => handle.result)).then((results) => {
-        queueCompletedRun(pi, runner, runId, runDir, handles, results, ctx.sessionManager.getSessionId());
+      // Background children deliberately outlive the spawning turn, so nothing
+      // binds this turn's abort signal: a later Esc must not kill promised
+      // work. Stop a run from /agents instead.
+      void handle.result.then((result) => {
+        queueCompletedRun(pi, runner, handle, result, sessionId);
       }).catch((error) => {
         reportDiagnostic(`[subagent-workflow] background delivery failed: ${errorMessage(error)}`);
       });
-      return detailedResult(JSON.stringify(handles.length === 1
-        ? { id: handles[0]!.id, runId, runDir, status: handles[0]!.status, label: specs[0]!.label }
-        : handles.map((handle, index) => ({ id: handle.id, status: handle.status, label: specs[index]!.label }))), launched);
+      return detailedResult(
+        JSON.stringify({ id: handle.id, runId, runDir, status: handle.status, label: spec.label }),
+        initialDetails(spec, handle, display),
+      );
     },
     renderCall(args, theme) {
-      if (args.followUp) {
-        // Prefer the caller's name for the turn; the source child id is the
-        // fallback and stays visible in the run record either way.
-        return renderCallHeader({ fanout: false, count: 1, label: `follow-up · ${args.label ?? args.followUp.id}` }, theme);
-      }
-      const fanout = Array.isArray(args.specs) && args.specs.length > 1;
-      const count = fanout ? args.specs!.length : 1;
-      const label = args.label ?? (args.prompt ? childLabel({ prompt: args.prompt }) : "Subagent");
-      return renderCallHeader({ fanout, count, label }, theme);
+      // For a follow-up, prefer the caller's name for the turn; the source child
+      // id is the fallback and stays visible in the run record either way.
+      const label = args.followUp
+        ? `follow-up · ${args.label ?? args.followUp.id}`
+        : args.label ?? (args.prompt ? childLabel({ prompt: args.prompt }) : "Subagent");
+      return renderCallHeader(label, theme);
     },
-    renderResult(result, options, theme, context) {
-      return renderSubagentResult(result, options, theme, context.lastComponent);
+    renderResult(result, _options, theme, context) {
+      return renderSubagentResult(result, theme, context.lastComponent);
     },
   };
   pi.registerTool(tool);
-}
-
-/** Subscribe to child events and stream a throttled (~10Hz) details snapshot to the tool row. */
-function streamRows(onUpdate: ((result: Detailed) => void) | undefined, tracker: SubagentRowTracker, handles: ReturnType<SubagentRunner["spawnRun"]>): () => void {
-  let pending: ReturnType<typeof setTimeout> | undefined;
-  let active = true;
-  let unsubscribers: Array<() => void> = [];
-  const stop = (): void => {
-    if (!active) return;
-    active = false;
-    if (pending) { clearTimeout(pending); pending = undefined; }
-    unsubscribers.forEach((unsubscribe) => unsubscribe());
-    unsubscribers = [];
-  };
-  const flush = (): void => {
-    pending = undefined;
-    if (!active) return;
-    try {
-      onUpdate?.({ content: [{ type: "text", text: handles.map((handle) => `${handle.id}: ${handle.status}`).join("\n") }], details: tracker.snapshot(handles) });
-    } catch (error) {
-      reportDiagnostic(`[subagent-workflow] tool-row update failed: ${errorMessage(error)}`);
-      stop();
-    }
-  };
-  unsubscribers = handles.map((handle) => handle.subscribe((event) => {
-    if (!active) return;
-    try {
-      tracker.observe(event);
-      if (!pending) pending = setTimeout(flush, 100);
-    } catch (error) {
-      reportDiagnostic(`[subagent-workflow] tool-row tracking failed: ${errorMessage(error)}`);
-      stop();
-    }
-  }));
-  return stop;
 }
 
 function detailedResult(text: string, details: SubagentDetails | undefined): Detailed {
   return { content: [{ type: "text", text }], details };
 }
 
-function detachedResult(runId: string, runDir: string, details: SubagentDetails | undefined): Detailed {
-  return detailedResult(JSON.stringify({
-    type: "subagent_backgrounded",
-    runId,
-    runDir,
-    status: "running",
-    note: "The user moved this run to the background. Do not wait or poll; the result will arrive as a steered message. Continue other work or end the turn.",
-  }), details);
-}
-
-export function formatWaitResult(runId: string, runDir: string, results: SubagentResult[], degraded?: string): string {
-  // stringifyDeliveryJson, not raw JSON.stringify: child text can carry DEL/C1
-  // controls that would otherwise reach the parent transcript unescaped.
-  const structured = stringifyDeliveryJson({
-    type: "subagent_results",
-    runId,
-    runDir,
-    results,
-    ...(degraded === undefined ? {} : { warning: degraded }),
-  });
-  return structured.length <= DELIVERY_ENVELOPE_BUDGET ? structured : formatDelivery(runId, runDir, results, degraded);
-}
-
-export function formatDelivery(runId: string, runDir: string, results: SubagentResult[], degraded?: string): string {
+export function formatDelivery(runId: string, runDir: string, result: SubagentResult, degraded?: string): string {
   const safeRunId = safeDeliveryValue(runId);
   const safeRunDir = safeDeliveryValue(runDir);
-  const deliveredResults = results.map((result) => ({
+  const delivered = {
     ...result,
     id: safeDeliveryValue(result.id),
     ...(result.sessionFile === undefined ? {} : { sessionFile: safeDeliveryValue(result.sessionFile) }),
     resolved: { ...result.resolved, label: safeDeliveryValue(result.resolved.label) },
     ...(result.error === undefined ? {} : { error: formatFailureText(result.error) }),
-  }));
-  const completedCount = deliveredResults.filter((result) => result.status === "completed").length;
-  const failedCount = deliveredResults.filter((result) => result.status === "failed").length;
-  const abortedCount = deliveredResults.filter((result) => result.status === "aborted").length;
-  const status = results.length === 1
-    ? deliveredResults[0]!.status
-    : [
-      completedCount > 0 ? "completed" : undefined,
-      failedCount > 0 ? `${failedCount} failed child${failedCount === 1 ? "" : "ren"}` : undefined,
-      abortedCount > 0 ? `${abortedCount} aborted` : undefined,
-    ].filter((part): part is string => part !== undefined).join(", ");
-  const failureGroups = groupFailedChildren(deliveredResults.filter((result) => result.status === "failed")).map((group) => {
-    const labels = `${group.labels.join(", ")}${group.count > group.labels.length ? ", ..." : ""}`;
-    return `${group.count} failed child${group.count === 1 ? "" : "ren"} (${labels}): ${group.error}`;
-  });
-  for (const result of deliveredResults.filter((entry) => entry.status === "aborted")) {
-    failureGroups.push(`Aborted child ${result.id} (${result.resolved.label})`);
-  }
+  };
   const runRecord = `${safeRunDir}/run.json`;
   const eventsRecord = `${safeRunDir}/events.jsonl`;
   return buildDeliveryEnvelope({
     header: [
       `Subagent run ${safeRunId}`,
       `Run directory: ${safeRunDir}`,
-      `Status: ${status}`,
-      ...deliveredResults.map((result) => `Child ${result.id} (${result.resolved.label}): ${result.status}`),
+      `Status: ${delivered.status}`,
+      `Child ${delivered.id} (${delivered.resolved.label}): ${delivered.status}`,
     ],
-    failures: failureGroups,
-    recovery: failedCount > 0 ? ["Recovery: respawn failed children with the same prompts and options."] : [],
+    failures: delivered.status === "failed"
+      ? [`Failed child ${delivered.id} (${delivered.resolved.label}): ${delivered.error ?? "Unknown error"}`]
+      : delivered.status === "aborted" ? [`Aborted child ${delivered.id} (${delivered.resolved.label})`] : [],
+    recovery: delivered.status === "failed" ? ["Recovery: respawn the child with the same prompt and options."] : [],
     warnings: degraded ? [`Warning: run persistence degraded (${safeDeliveryValue(degraded)}); the run directory may be incomplete`] : [],
     artifacts: [`Run record: ${runRecord}`],
-    auxiliaryArtifacts: deliveredResults
-      .filter((result) => result.sessionFile !== undefined)
-      .map((result) => `Child ${result.id} session: ${result.sessionFile}`),
-    resultPreview: chunkDeliveryText(stringifyDeliveryJson({ type: "subagent_results", results: deliveredResults })),
+    auxiliaryArtifacts: delivered.sessionFile === undefined ? [] : [`Child ${delivered.id} session: ${delivered.sessionFile}`],
+    resultPreview: chunkDeliveryText(stringifyDeliveryJson({ type: "subagent_results", results: [delivered] })),
     truncationMarker: degraded
       ? `[truncated - result may be incomplete at ${eventsRecord}; run persistence degraded]`
       : `[truncated - full result remains available via ${eventsRecord}]`,
@@ -555,11 +423,11 @@ export function formatDelivery(runId: string, runDir: string, results: SubagentR
  * result is never redelivered to the model. `deliver` runs between the two
  * so an inline delivery can still surface a degraded-persistence warning.
  */
-export function fenceDirectlyDeliveredRun<T>(pi: ExtensionAPI, runner: SubagentRunner, runId: string, runDir: string,
-  handles: ReturnType<SubagentRunner["spawnRun"]>, results: SubagentResult[], sessionId: string,
-  deliver: (degraded: string | undefined) => T): T {
-  recordCompletedRun(pi, runId, runDir, handles, results);
-  const identity = resultDeliveryIdentity(runId, results);
+export function fenceDirectlyDeliveredRun<T>(pi: ExtensionAPI, runner: SubagentRunner, handle: SubagentHandle,
+  result: SubagentResult, sessionId: string, deliver: (degraded: string | undefined) => T): T {
+  const { runId, runDir } = handle;
+  recordCompletedRun(pi, handle, result);
+  const identity = resultDeliveryIdentity(runId, result);
   const delivered = deliver(runner.markDelivered(runId));
   if (!writeDeliveryMarker(runDir, sessionId, identity)) {
     throw new Error(`Run ${runId} changed generation before direct delivery could be recorded`);
@@ -567,38 +435,33 @@ export function fenceDirectlyDeliveredRun<T>(pi: ExtensionAPI, runner: SubagentR
   return delivered;
 }
 
-function queueCompletedRun(pi: ExtensionAPI, runner: SubagentRunner, runId: string, runDir: string,
-  handles: ReturnType<SubagentRunner["spawnRun"]>, results: SubagentResult[], sessionId: string): void {
-  recordCompletedRun(pi, runId, runDir, handles, results);
-  const identity = resultDeliveryIdentity(runId, results);
-  const message = formatDelivery(runId, runDir, results, runner.finalizedRunWarning(runId));
+function queueCompletedRun(pi: ExtensionAPI, runner: SubagentRunner, handle: SubagentHandle,
+  result: SubagentResult, sessionId: string): void {
+  const { runId, runDir } = handle;
+  recordCompletedRun(pi, handle, result);
   queueAcknowledgedDelivery(pi, {
     sessionId,
-    message,
-    targets: [{ runDir, identity }],
+    message: formatDelivery(runId, runDir, result, runner.finalizedRunWarning(runId)),
+    targets: [{ runDir, identity: resultDeliveryIdentity(runId, result) }],
   });
   runner.markDelivered(runId);
 }
 
-function recordCompletedRun(pi: ExtensionAPI, runId: string, runDir: string,
-  handles: ReturnType<SubagentRunner["spawnRun"]>, results: SubagentResult[]): void {
-  const durationMs = Date.now() - Math.min(...handles.map((handle) => handle.startedAt));
+function recordCompletedRun(pi: ExtensionAPI, handle: SubagentHandle, result: SubagentResult): void {
   appendEntrySafely(pi, "subagent-workflow:run-completed", {
-    runId,
-    runDir,
-    generation: resultDeliveryIdentity(runId, results).generation,
-    perChild: results.map((result) => ({ id: result.id, status: result.status, label: result.resolved.label })),
-    usageTotals: sumUsage(results.map((result) => result.usage)),
-    durationMs,
+    runId: handle.runId,
+    runDir: handle.runDir,
+    generation: resultDeliveryIdentity(handle.runId, result).generation,
+    perChild: [{ id: result.id, status: result.status, label: result.resolved.label }],
+    usageTotals: sumUsage([result.usage]),
+    durationMs: Date.now() - handle.startedAt,
   });
 }
 
-function resultDeliveryIdentity(runId: string, results: readonly SubagentResult[]): RunDeliveryIdentity {
-  const generations = new Set(results.map((result) => result.generation));
-  if (generations.size !== 1) throw new Error(`Run ${runId} completed with mixed delivery generations`);
-  const generation = results[0]?.generation;
-  if (!Number.isSafeInteger(generation) || generation! < 1) {
+function resultDeliveryIdentity(runId: string, result: SubagentResult): RunDeliveryIdentity {
+  const generation = result.generation;
+  if (generation === undefined || !Number.isSafeInteger(generation) || generation < 1) {
     throw new Error(`Run ${runId} completed without a valid delivery generation`);
   }
-  return { protocol: DELIVERY_PROTOCOL_VERSION, generation: generation! };
+  return { protocol: DELIVERY_PROTOCOL_VERSION, generation };
 }

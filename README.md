@@ -22,18 +22,16 @@ Registers the `subagent` and `workflow` tools, the `/agents` navigator, and the 
 
 ## `subagent`
 
-Spawn one child, or fan out up to 16 in a single call. Children start cold with only their prompt and run in the background by default; the result arrives as a steered message.
+Spawn one child. Children start cold with only their prompt and run in the background; the result arrives later as a steered message. For several independent children, call the tool several times in the same turn (beyond about eight, use `workflow`). In a headless host (`pi -p` / `--mode json`), where the session ends with the turn, the call instead blocks and returns the result inline.
 
 | Field | Meaning |
 |---|---|
-| `prompt` | The task. Required for a single child. |
+| `prompt` | The task. Required unless `followUp` is set. |
 | `model` | `"provider/model-id"`. Inherits the parent's when unset. |
 | `thinkingLevel` | `off`…`max`. Inherits when unset. |
 | `schema` | JSON Schema requiring structured output (validated; one repair attempt on a miss). |
 | `isolation` | `"worktree"` runs in a temp git worktree; changes return as a patch, never auto-applied. |
-| `specs` | Array (≤16) for a fan-out. One dead child never kills the batch. |
 | `followUp` | `{ id, prompt }` forks a completed child's session into a new run. |
-| `wait` | `true` blocks and returns inline; default is background delivery. |
 
 Concurrency across all spawns is bounded by one global semaphore (`/workflow-settings` to change). `tools`/`excludeTools` narrow the child's toolset; `subagent` and `workflow` are always excluded.
 
@@ -101,7 +99,7 @@ Run `/workflow-settings` (alias `/subagent-settings`) for the interactive editor
 
 The settings file uses schema v4 and contains exactly these four keys plus `version`. A strictly valid v2 or v3 file is migrated to v4 in place once, with a single notice (the deleted keys are dropped). Any other missing or unsupported version warns loudly, resets the in-memory settings to defaults, and leaves the old file unchanged; `/workflow-settings reset` or the next explicit setting change writes a complete v4 file. A malformed v4 file also loads safe defaults with a warning, but ordinary edits refuse to overwrite it; fix it manually or use `/workflow-settings reset`. Reducing concurrency does not cancel running children; it pauses new admissions until enough active work drains. Timeout changes apply only to prompts admitted afterwards. Internal VM, ownership, journal, and size safety constants are intentionally not configurable.
 
-Workflow launch validates every string-literal `model:` value in the script against the model registry and refuses to start on an unknown id, with a near-miss suggestion; the subagent tool fails a call the same way when every spec names an unknown model, while a mixed fan-out still spawns so one bad spec cannot kill valid siblings.
+Workflow launch validates every string-literal `model:` value in the script against the model registry and refuses to start on an unknown id, with a near-miss suggestion; the subagent tool fails a call the same way when it names an unknown model.
 
 ### Resume
 
@@ -119,7 +117,7 @@ Reuse is *earned* by a successful run, not designed up front.
 
 ## The `/agents` navigator
 
-`/agents` (alias `/workflows`) opens a centered overlay listing runs for the current cwd - standalone subagents, fan-outs, and workflows - with live runs pinned on top and history below. It has three levels:
+`/agents` (alias `/workflows`) opens a centered overlay listing runs for the current cwd - standalone subagents and workflows - with live runs pinned on top and history below. It has three levels:
 
 - **Run list** - status, label, kind, progress, tokens, age.
 - **Run detail** - a workflow expands into phases with per-phase agent groups and interleaved narrator log lines; a subagent run lists its children directly. Within a phase (and for subagent runs) children sort alphabetically by label, so rows keep their place as queued workers start.

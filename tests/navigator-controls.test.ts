@@ -47,9 +47,7 @@ test("keyToAction maps keys per level; f only filters at run level; only enter s
   expect(keyToAction("right", "agent")).toEqual({ type: "none" });
   expect(keyToAction("escape", "run")).toEqual({ type: "back" });
   expect(keyToAction("x", "run")).toEqual({ type: "stop" });
-  expect(keyToAction("b", "runs")).toEqual({ type: "background" });
-  expect(keyToAction("b", "run")).toEqual({ type: "background" });
-  expect(keyToAction("b", "agent")).toEqual({ type: "none" });
+  expect(keyToAction("b", "runs")).toEqual({ type: "none" });
   expect(keyToAction("r", "runs")).toEqual({ type: "none" });
   expect(keyToAction("r", "run")).toEqual({ type: "none" });
   expect(keyToAction("f", "run")).toEqual({ type: "filter" });
@@ -62,7 +60,7 @@ test("keyToAction maps keys per level; f only filters at run level; only enter s
 function runSummary(runId: string): RunSummary {
   return {
     runId, runDir: `/runs/${runId}`, kind: "subagent", createdAt: 0, label: runId,
-    fanout: false, status: "completed", done: 1, total: 1, completed: 1, failed: 0, aborted: 0, tokens: 0,
+    status: "completed", done: 1, total: 1, completed: 1, failed: 0, aborted: 0, tokens: 0,
     corrupt: false, reconciled: false,
   };
 }
@@ -195,9 +193,8 @@ test("footerHint composes per level and never advertises pause", () => {
   expect(runs).not.toContain("b background");
   expect(runs).not.toContain("s save");
   expect(runs).not.toContain("tab next live");
-  const liveRuns = footerHint({ level: "runs", canCycle: true, canStop: true, canBackground: true, canSave: true }, PLAIN);
+  const liveRuns = footerHint({ level: "runs", canCycle: true, canStop: true, canSave: true }, PLAIN);
   expect(liveRuns).toContain("x stop");
-  expect(liveRuns).toContain("b background");
   expect(liveRuns).toContain("s save");
   expect(liveRuns).toContain("tab next live");
   expect(footerHint({ level: "runs", canStop: true, stopArmed: true }, PLAIN)).toContain("x again to STOP");
@@ -209,7 +206,6 @@ test("footerHint composes per level and never advertises pause", () => {
   expect(run).not.toContain("b background");
   expect(run).not.toContain("tab next live");
   expect(footerHint({ level: "run", filter: "all", canCycle: true }, PLAIN)).toContain("tab next live");
-  expect(footerHint({ level: "run", filter: "all", canBackground: true }, PLAIN)).toContain("b background");
   expect(footerHint({ level: "run", filter: "all", canStop: true, stopArmed: true }, PLAIN)).toContain("x again to STOP");
   expect(run).not.toContain("restart");
 
@@ -234,7 +230,7 @@ test("run-detail footer only advertises actions available for the run", () => {
     runId: "subagent-terminal", runDir: "/subagent-terminal", kind: "subagent", label: "done", status: "completed",
     phases: [], children: [], narrator: [], hasScript: false, corrupt: false,
   };
-  const terminalActions = runActionAvailability(terminalSubagent, false, ["completed"], false, true);
+  const terminalActions = runActionAvailability(terminalSubagent, false, ["completed"], true);
   const terminalFooter = footerHint({ level: "run", ...terminalActions }, PLAIN);
   expect(terminalFooter).not.toContain("x stop");
   expect(terminalFooter).not.toContain("s save");
@@ -246,11 +242,9 @@ test("run-detail footer only advertises actions available for the run", () => {
     status: "running",
     hasScript: true,
   };
-  const runningActions = runActionAvailability(runningWorkflow, true, [], true, true);
+  const runningActions = runActionAvailability(runningWorkflow, true, [], true);
   const runningFooter = footerHint({ level: "run", ...runningActions }, PLAIN);
-  expect(runningActions.canBackground).toBe(true);
   expect(runningFooter).toContain("x stop");
-  expect(runningFooter).toContain("b background");
   expect(runningFooter).not.toContain("s save");
 
   const completedWorkflow: RunDetail = {
@@ -258,7 +252,7 @@ test("run-detail footer only advertises actions available for the run", () => {
     runId: "workflow-completed",
     status: "completed",
   };
-  const completedActions = runActionAvailability(completedWorkflow, false, ["completed"], false, true);
+  const completedActions = runActionAvailability(completedWorkflow, false, ["completed"], true);
   const completedFooter = footerHint({ level: "run", ...completedActions }, PLAIN);
   expect(completedFooter).not.toContain("x stop");
   expect(completedFooter).toContain("s save");
@@ -351,8 +345,6 @@ function fakeNavigatorRunner(liveRunIds: () => string[]): NavigatorRunner {
     liveSession: () => undefined,
     get: () => undefined,
     stopRun: async () => {},
-    waitedRunIds: () => [],
-    detachWaitedRun: () => false,
     subscribeSpawns: () => () => {},
   };
 }
@@ -807,76 +799,3 @@ test("navigator open is reentrant-safe and releases its guard after close", asyn
   expect(customCalls).toBe(2);
 });
 
-test("navigator cannot background another session's waited run", async () => {
-  const cwd = "/navigator/session-scope";
-  const root = mkdtempSync(join(tmpdir(), "navigator-session-scope-"));
-  const runDir = join(root, encodeCwd(cwd), "run-other");
-  mkdirSync(runDir, { recursive: true });
-  writeFileSync(join(runDir, "run.json"), JSON.stringify({
-    v: 3,
-    runId: "run-other",
-    kind: "subagent",
-    createdAt: "2026-07-15T00:00:00.000Z",
-    parent: { sessionId: "session-other" },
-    children: [],
-  }));
-  writeFileSync(join(runDir, "status.json"), JSON.stringify({ status: "completed", children: {} }));
-  writeFileSync(join(runDir, "events.jsonl"), "");
-
-  const waitedCalls: string[] = [];
-  const detachCalls: Array<[string, string]> = [];
-  const runner = {
-    liveRunIds: () => [],
-    runHandles: () => [],
-    liveSession: () => undefined,
-    get: () => undefined,
-    stopRun: async () => {},
-    waitedRunIds: (parentSessionId: string) => {
-      waitedCalls.push(parentSessionId);
-      return parentSessionId === "session-other" ? ["run-other"] : [];
-    },
-    detachWaitedRun: (runId: string, parentSessionId: string) => {
-      detachCalls.push([runId, parentSessionId]);
-      return runId === "run-other" && parentSessionId === "session-other";
-    },
-    subscribeSpawns: () => () => {},
-  } as unknown as NavigatorRunner;
-  let command: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
-  const pi = {
-    registerCommand: (name: string, registered: typeof command) => {
-      if (name === "agents") command = registered;
-    },
-  } as unknown as ExtensionAPI;
-  const notifications: string[] = [];
-  let rendered: string[] = [];
-  registerNavigator(pi, { runner, root });
-
-  try {
-    await command!.handler("", {
-      cwd,
-      hasUI: true,
-      sessionManager: { getSessionId: () => "session-current" },
-      ui: {
-        custom: async (factory: (...args: any[]) => any) => {
-          const component = factory(
-            { requestRender: () => {}, terminal: { rows: 24 } },
-            PLAIN,
-            {},
-            () => {},
-          );
-          rendered = component.render(100);
-          component.handleInput("b");
-          component.dispose?.();
-        },
-        notify: (message: string) => { notifications.push(message); },
-      },
-    });
-
-    expect(rendered.join("\n")).not.toContain("b background");
-    expect(waitedCalls).toEqual(["session-current"]);
-    expect(detachCalls).toEqual([["run-other", "session-current"]]);
-    expect(notifications).toContain("Run is not blocking a waited tool call");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});

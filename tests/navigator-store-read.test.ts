@@ -93,10 +93,11 @@ test("lists runs newest-first, derives labels, tolerates corrupt dirs", () => {
   expect(workflow.done).toBe(2);
   expect(workflow.tokens).toBe(150);
 
-  const fanout = rows[newIndex]!;
-  expect(fanout.fanout).toBe(true);
-  expect(fanout.label).toBe("fan-out ×2");
-  expect(fanout.status).toBe("running");
+  // A legacy multi-child run record still lists and labels from its first child.
+  const legacy = rows[newIndex]!;
+  expect(legacy.label).toBe("Fetcher");
+  expect(legacy.status).toBe("running");
+  expect(legacy.total).toBe(2);
 
   const broken = rows.find((r) => r.runId === "run-broken")!;
   expect(broken.corrupt).toBe(true);

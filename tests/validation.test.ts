@@ -13,57 +13,39 @@ import type { ResolvedSpec, SubagentSpec, SubagentStatus } from "../src/types.js
 
 
 describe("subagent validation", () => {
-  test("requires exactly one of prompt, specs, or followUp", () => {
-    expect(() => validateSubagentInput({})).toThrow("Provide exactly one of prompt, specs, or followUp");
-    expect(() => validateSubagentInput({ prompt: "one", specs: [{ prompt: "two" }] }))
-      .toThrow("Provide exactly one of prompt, specs, or followUp");
+  test("requires exactly one of prompt or followUp", () => {
+    expect(() => validateSubagentInput({})).toThrow("Provide exactly one of prompt or followUp");
     expect(() => validateSubagentInput({ prompt: "one", followUp: { id: "child", prompt: "two" } }))
-      .toThrow("Provide exactly one of prompt, specs, or followUp");
+      .toThrow("Provide exactly one of prompt or followUp");
     expect(validateSubagentInput({ prompt: "one" })).toEqual({
       type: "spawn",
-      specs: [{ prompt: "one", model: undefined, thinkingLevel: undefined, tools: undefined, excludeTools: undefined,
-        schema: undefined, cwd: undefined, label: undefined, isolation: undefined }],
+      spec: { prompt: "one", model: undefined, thinkingLevel: undefined, tools: undefined, excludeTools: undefined,
+        schema: undefined, cwd: undefined, label: undefined, isolation: undefined },
     });
     expect(validateSubagentInput({ followUp: { id: "child", prompt: "continue" } })).toEqual({
       type: "followUp", id: "child", prompt: "continue",
     });
   });
 
-  test("accepts a spec with schema and rejects whitespace-only prompts anywhere", () => {
+  test("accepts a spec with schema and rejects whitespace-only prompts", () => {
     expect(() => validateSubagentInput({ prompt: "x", schema: { type: "object" } })).not.toThrow();
     expect(() => validateSubagentInput({ prompt: "   " })).toThrow("must not be empty");
-    expect(() => validateSubagentInput({ specs: [{ prompt: "ok" }, { prompt: " " }] })).toThrow("must not be empty");
   });
 
-  test("runtime validation rejects invalid values, wrong types, and unknown spec fields", () => {
+  test("runtime validation rejects invalid values, wrong types, and unknown fields", () => {
     expect(() => validateSubagentInput({ prompt: "x", isolation: "work-tree" } as never))
       .toThrow("Invalid subagent input/isolation");
     expect(() => validateSubagentInput({ prompt: "x", tools: "read" } as never))
       .toThrow("Invalid subagent input/tools");
-    expect(() => validateSubagentInput({ specs: [{ prompt: "x", surprise: true }] } as never))
-      .toThrow("Invalid subagent input/specs/0/surprise");
+    expect(() => validateSubagentInput({ prompt: "x", surprise: true } as never))
+      .toThrow("Invalid subagent input/surprise");
     expect(() => validateSubagentInput({ followUp: { id: "subagent-1", prompt: "continue", schema: {} } } as never))
       .toThrow("Invalid subagent input/followUp/schema");
   });
 
-  test("schema rejects a direct empty model but leaves fan-out model failures per child", () => {
+  test("schema rejects an empty model", () => {
     expect(Value.Check(SubagentToolParameters, { prompt: "one", model: "" })).toBe(false);
-    expect(Value.Check(SubagentToolParameters, {
-      specs: [{ prompt: "inherits" }, { prompt: "fails independently", model: "" }],
-    })).toBe(true);
-  });
-
-  test("rejects per-spec fields set at the top level alongside specs", () => {
-    expect(() => validateSubagentInput({ specs: [{ prompt: "a" }], model: "openai-codex/gpt-5.6-luna" }))
-      .toThrow("set model inside each specs entry");
-    expect(() => validateSubagentInput({ specs: [{ prompt: "a" }], isolation: "worktree" }))
-      .toThrow("set isolation inside each specs entry");
-    expect(() => validateSubagentInput({ followUp: { id: "child", prompt: "more" }, tools: ["read"] }))
-      .toThrow("With followUp, tools is invalid at the top level");
-    expect(validateSubagentInput({ specs: [{ prompt: "a", model: "p/m" }] })).toEqual({
-      type: "spawn",
-      specs: [{ prompt: "a", model: "p/m" }],
-    });
+    expect(Value.Check(SubagentToolParameters, { prompt: "one", model: "p/m" })).toBe(true);
   });
 
   test("a follow-up may name the new turn but not redescribe the agent", () => {

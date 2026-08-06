@@ -8,7 +8,7 @@ import type { ChildRow, RunDetail, RunSummary } from "../src/ui/navigator/store-
 const NOW = 1_000_000;
 
 function summary(over: Partial<RunSummary> & { runId: string }): RunSummary {
-  return { runDir: `/r/${over.runId}`, kind: "subagent", createdAt: NOW - 5000, label: over.runId, fanout: false, status: "completed", done: 1, total: 1, completed: 1, failed: 0, aborted: 0, tokens: 0, corrupt: false, reconciled: false, ...over };
+  return { runDir: `/r/${over.runId}`, kind: "subagent", createdAt: NOW - 5000, label: over.runId, status: "completed", done: 1, total: 1, completed: 1, failed: 0, aborted: 0, tokens: 0, corrupt: false, reconciled: false, ...over };
 }
 
 test("renderRunList marks the cursor row and renders corrupt rows dimly, staying within width", () => {

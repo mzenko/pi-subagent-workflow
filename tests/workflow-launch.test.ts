@@ -11,7 +11,7 @@ import { activityFoldFromSnapshot } from "../src/store/activity-fold.js";
 import { RunStore } from "../src/store/run-store.js";
 import { readRunSnapshot } from "../src/store/run-snapshot.js";
 import { stringifyDeliveryJson } from "../src/ui/delivery-safe.js";
-import { completeWorkflow, formatWorkflowDelivery, formatWorkflowResult, groupFailedChildren, launchWorkflow, formatToolActivity, summarizeActivityFold, summarizeChildToolActivity, workflowStartedMarker } from "../src/workflow/launch.js";
+import { formatWorkflowDelivery, groupFailedChildren, launchWorkflow, formatToolActivity, summarizeActivityFold, summarizeChildToolActivity, workflowStartedMarker } from "../src/workflow/launch.js";
 import { parseWorkflowScript } from "../src/workflow/parser.js";
 import type { WorkflowRunResult } from "../src/workflow/workflow-runner.js";
 
@@ -136,33 +136,6 @@ test("launch returns before script logs and execution settlement", async () => {
     if (runRoot) rmSync(runRoot, { recursive: true, force: true });
     restoreAgentDir();
     rmSync(cwd, { recursive: true, force: true });
-  }
-});
-
-test("workflow wait completion survives transcript marker failure and writes its delivery marker", () => {
-  const runDir = mkdtempSync(join(tmpdir(), "workflow-wait-delivery-"));
-  const pi = { appendEntry: () => { throw new Error("transcript closed"); } } as unknown as ExtensionAPI;
-  writeProtocolWorkflow(runDir, "workflow-test-1", 1);
-  const result = {
-    runId: "workflow-test-1",
-    runDir,
-    generation: 1,
-    meta: { name: "marker-test", description: "test" },
-    result: "done",
-    failedChildren: [],
-  } satisfies WorkflowRunResult;
-  const errorLog = spyOn(console, "error").mockImplementation(() => {});
-  try {
-    expect(completeWorkflow(pi, result, "parent", () => "delivered")).toBe("delivered");
-    expect(JSON.parse(readFileSync(join(runDir, "delivered.json"), "utf8"))).toEqual({
-      v: 1,
-      sessionId: "parent",
-      catchUp: false,
-      generation: 1,
-    });
-  } finally {
-    errorLog.mockRestore();
-    rmSync(runDir, { recursive: true, force: true });
   }
 });
 
@@ -307,62 +280,24 @@ test("identical child failures group into one line with one recovery invocation"
   expect(delivery.match(/Recovery:/g)).toHaveLength(1);
 });
 
-test("an under-cap wait result includes run identity, status, failed children, and persistence warning", () => {
-  const failed = failedChild("c1", "France", "boom");
-  const text = formatWorkflowResult({
-    ...runResult([failed]),
-    persistenceWarning: "journal write degraded",
-  });
-  expect(JSON.parse(text)).toEqual({
-    type: "workflow_result",
-    runId: "run-1",
-    runDir: "/tmp/run-1",
-    status: "completed with 1 failed child",
-    result: { ok: true },
-    failedChildren: [failed],
-    warning: "journal write degraded",
-  });
-});
-
-test("oversized failure diagnostics fall back to the bounded prose envelope", () => {
-  const text = formatWorkflowResult(runResult([failedChild("c1", "France", "y".repeat(20_000))]));
-  expect(text.length).toBeLessThanOrEqual(16_000);
-  expect(text).toContain("Workflow run run-1");
-  expect(text).toContain("1 failed child (France):");
-});
-
-test("wait and background workflow results use one consistent bounded envelope", () => {
-  const result = {
-    ...runResult([failedChild("c1", "France", "boom")]),
+test("oversized failure diagnostics stay inside the bounded prose envelope", () => {
+  const background = formatWorkflowDelivery({
+    ...runResult([failedChild("c1", "France", "y".repeat(20_000))]),
     result: "x".repeat(20_000),
     persistenceWarning: "journal write degraded",
-  };
-  const waited = formatWorkflowResult(result);
-  const background = formatWorkflowDelivery(result);
-
-  expect(waited).toBe(background);
-  expect(waited.length).toBe(16_000);
-  expect(waited).toContain("Status: completed with 1 failed child");
-  expect(waited).toContain("1 failed child (France): boom");
-  expect(waited).toContain("Recovery: workflow(");
-  expect(waited).toContain("Warning: journal write degraded");
-  expect(waited).toContain("Result artifact: /tmp/run-1/result.json");
-  expect(waited).toContain("[truncated - full result persisted at /tmp/run-1/result.json]");
-  expect(waited).not.toContain("x".repeat(20_000));
+  } as never);
+  expect(background.length).toBe(16_000);
+  expect(background).toContain("Workflow run run-1");
+  expect(background).toContain("Status: completed with 1 failed child");
+  expect(background).toContain("Recovery: workflow(");
+  expect(background).toContain("Warning: journal write degraded");
+  expect(background).toContain("Result artifact: /tmp/run-1/result.json");
+  expect(background).toContain("[truncated - full result persisted at /tmp/run-1/result.json]");
+  expect(background).not.toContain("x".repeat(20_000));
 });
 
-test("a small workflow wait result uses structured JSON while background keeps prose", () => {
-  const result = runResult([]);
-  const waited = formatWorkflowResult(result);
-  const background = formatWorkflowDelivery(result);
-
-  expect(JSON.parse(waited)).toEqual({
-    type: "workflow_result",
-    runId: "run-1",
-    runDir: "/tmp/run-1",
-    status: "completed",
-    result: { ok: true },
-  });
+test("a small workflow result delivers the full prose envelope with the result JSON", () => {
+  const background = formatWorkflowDelivery(runResult([]));
   expect(background).toContain("Workflow run run-1");
   expect(background).toContain(stringifyDeliveryJson({ type: "workflow_result", result: { ok: true } }));
 });
@@ -516,10 +451,12 @@ test("the runner's incremental activity projection matches the batch snapshot fo
   }, new Semaphore(2), () => store);
 
   try {
-    const handles = runner.spawnRun([
-      { prompt: "research", label: "submitted-researcher" },
-      { prompt: "summarize", label: "submitted-summarizer" },
-    ], parent, { runId: "workflow-activity", store });
+    // A workflow builds its multi-child run through repeated single spawns
+    // sharing one runId and store - the same shape workflow-runner uses.
+    const handles = [
+      runner.spawnRun({ prompt: "research", label: "submitted-researcher" }, parent, { runId: "workflow-activity", store }),
+      runner.spawnRun({ prompt: "summarize", label: "submitted-summarizer" }, parent, { runId: "workflow-activity", store }),
+    ];
     await Promise.all(handles.map((handle) => handle.result));
 
     const incremental = runner.runActivityFold("workflow-activity")!;

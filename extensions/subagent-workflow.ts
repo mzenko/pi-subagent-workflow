@@ -84,23 +84,20 @@ export function createNavigatorFollowUp(
       preflight(resolved.spec, parent, { forkSessionFile: resolved.forkSessionFile });
       // directDelivery rides inside run.json, written before any child starts:
       // a crash at any later point leaves a run catch-up already knows to skip.
-      const handles = runner.spawnRun([resolved], parent, { directDelivery: true });
-      const handle = handles[0];
-      if (!handle) throw new Error("Follow-up spawn did not create a child");
+      const handle = runner.spawnRun(resolved, parent, { directDelivery: true });
       // spawnRun has persisted and started the child, so the run is committed
       // and nothing below may throw back to the caller: a thrown send() would
       // report a started run as a failed message and invite a duplicate spawn.
-      void Promise.all(handles.map((childHandle) => childHandle.result)).then((results: SubagentResult[]) => {
-        fenceDirectlyDeliveredRun(pi, runner, handle.runId, handle.runDir, handles, results, sessionId, (degraded) => degraded);
+      void handle.result.then((result: SubagentResult) => {
+        fenceDirectlyDeliveredRun(pi, runner, handle, result, sessionId, (degraded) => degraded);
         // The reply is model-fenced (directDelivery), so this notify is the
         // only signal a user who left the navigator gets that it arrived.
-        const label = results[0]?.resolved.label ?? handle.id;
-        ctx.ui.notify(`Reply from ${safeDeliveryValue(label)} ready - see /agents`, "info");
+        ctx.ui.notify(`Reply from ${safeDeliveryValue(result.resolved.label)} ready - see /agents`, "info");
       }).catch((error) => {
         reportDiagnostic(`[subagent-workflow] navigator follow-up completion failed: ${errorMessage(error)}`);
       });
       try {
-        dependencies.widget?.track(handle.runId, handles, false, ctx);
+        dependencies.widget?.track(handle.runId, handle, ctx);
       } catch (error) {
         reportDiagnostic(`[subagent-workflow] status widget failed: ${errorMessage(error)}`);
       }
@@ -317,7 +314,6 @@ function terminalStatus(value: unknown): TerminalStatus | undefined {
 function persistedRunLabel(record: Record<string, unknown> | undefined): string {
   const children = Array.isArray(record?.children) ? record.children : [];
   if (record?.kind === "workflow") return "workflow";
-  if (children.length > 1) return `fan-out ×${children.length}`;
   const child = jsonObject(children[0]);
   const resolvedLabel = jsonObject(child?.resolved)?.label;
   if (typeof resolvedLabel === "string" && resolvedLabel.trim()) return resolvedLabel.trim();
@@ -353,17 +349,6 @@ export default function subagentWorkflow(pi: ExtensionAPI): void {
     widget.observeWorkflowStarted(run, ctx);
   };
   registerWorkflowTool(pi, selfPath, { consent, approve: approveLaunch, approvalPolicy: policy, observeRun, resolveSaved });
-  pi.registerCommand("background", {
-    description: "Move all waited subagent/workflow runs in this session to the background",
-    handler: async (_args, ctx) => {
-      const detached = subagentRunner.detachWaitedRuns(ctx.sessionManager.getSessionId());
-      const message = detached.length === 0
-        ? "No waited runs to background"
-        : `Backgrounded ${detached.join(", ")}; results will arrive as steered messages`;
-      if (ctx.hasUI) ctx.ui.notify(message, "info");
-      else console.log(message);
-    },
-  });
 
   // Register the navigator before the other /work* commands. Pi's fuzzy
   // autocomplete preserves registration order for equal prefix matches, so

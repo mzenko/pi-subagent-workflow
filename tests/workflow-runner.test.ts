@@ -13,7 +13,7 @@ import type { ResolvedSpec, SubagentHandle, SubagentResult, SubagentSpec } from 
 import { readRunDetail } from "../src/ui/navigator/store-read.js";
 import { JournalUnreadableError } from "../src/workflow/journal.js";
 import { parseWorkflowScript } from "../src/workflow/parser.js";
-import { formatWorkflowResult } from "../src/workflow/launch.js";
+import { formatWorkflowDelivery } from "../src/workflow/launch.js";
 import { findLatestCompletedWorkflowRun, findWorkflowRunById, resolveRunDir } from "../src/workflow/saved.js";
 import { WORKFLOW_AGENT_CAP, WorkflowRunError, normalizeArgs, runWorkflow, startParsedWorkflow } from "../src/workflow/workflow-runner.js";
 
@@ -37,8 +37,7 @@ class FakeRunner {
   }
   unregisterRunController(runId: string): void { this.controllers.delete(runId); }
   isRunActive(runId: string): boolean { return this.controllers.has(runId); }
-  spawnRun(specs: SubagentSpec[], _parent: ParentContext, options: { runId: string; store: unknown }): SubagentHandle[] {
-    const spec = specs[0]!;
+  spawnRun(spec: SubagentSpec, _parent: ParentContext, options: { runId: string; store: unknown }): SubagentHandle {
     if (!(options.store instanceof RunStore)) throw new Error("workflow did not pass its RunStore to spawnRun");
     const store = options.store;
     const previousStore = this.stores.get(options.runId);
@@ -54,7 +53,7 @@ class FakeRunner {
       store.recordEvent({ type: "result", id, result: identified });
       return identified;
     });
-    return [{ id, runId: options.runId, runDir: store.runDir, spec, resolved: undefined, status: "running", startedAt: 0, result, steer: async () => {}, abort: async () => await this.abortFactory?.(spec, number), subscribe: () => () => {} }];
+    return { id, runId: options.runId, runDir: store.runDir, spec, resolved: undefined, status: "running", startedAt: 0, result, steer: async () => {}, abort: async () => await this.abortFactory?.(spec, number), subscribe: () => () => {} };
   }
 }
 
@@ -1100,15 +1099,14 @@ return { got: child === null };`;
     runner: runner as never,
   });
   expect(result.result).toEqual({ got: true });
-  expect(JSON.parse(formatWorkflowResult(result))).toMatchObject({
-    type: "workflow_result",
-    result: { got: true },
-    failedChildren: [{
-      id: "child-1",
-      error: "guarded failure",
-      resolved: { label: "resolved failure label" },
-    }],
-  });
+  expect(result.failedChildren).toMatchObject([{
+    id: "child-1",
+    error: "guarded failure",
+    resolved: { label: "resolved failure label" },
+  }]);
+  const delivery = formatWorkflowDelivery(result);
+  expect(delivery).toContain("1 failed child (resolved failure label): guarded failure");
+  expect(delivery).toContain('"got":true');
 });
 
 test("pre-lineage journals refuse resume with a typed error", async () => {

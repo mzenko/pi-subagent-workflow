@@ -38,50 +38,6 @@ test("runner hot reload ignores the old v16 process singleton", async () => {
   }
 });
 
-test("waited-run registry detaches idempotently and stays session-scoped", () => {
-  const runner = new SubagentRunner();
-  const detached: string[] = [];
-  runner.registerWaitedRun("run-a", "session-a", () => { detached.push("run-a"); return true; });
-  runner.registerWaitedRun("run-b", "session-b", () => { throw new Error("broken detach"); });
-  runner.registerWaitedRun("run-c", "session-a", () => { detached.push("run-c"); return true; });
-  runner.registerWaitedRun("run-e", "session-b", () => { detached.push("run-e"); return true; });
-  runner.registerWaitedRun("run-f", "session-b", () => false);
-
-  expect(runner.waitedRunIds("session-a")).toEqual(["run-a", "run-c"]);
-  expect(runner.waitedRunIds("session-b")).toEqual(["run-b", "run-e", "run-f"]);
-  expect(runner.detachWaitedRun("run-a", "session-b")).toBe(false);
-  expect(runner.waitedRunIds("session-a")).toEqual(["run-a", "run-c"]);
-  expect(runner.detachWaitedRun("run-a", "session-a")).toBe(true);
-  expect(runner.detachWaitedRun("run-a", "session-a")).toBe(false);
-  expect(detached).toEqual(["run-a"]);
-
-  runner.unregisterWaitedRun("run-c");
-  expect(runner.detachWaitedRun("run-c", "session-a")).toBe(false);
-  runner.registerWaitedRun("run-d", "session-a", () => { detached.push("run-d"); return true; });
-  expect(runner.detachWaitedRuns("session-a")).toEqual(["run-d"]);
-  expect(detached).toEqual(["run-a", "run-d"]);
-  expect(runner.waitedRunIds("session-a")).toEqual([]);
-  expect(runner.waitedRunIds("session-b")).toEqual(["run-b", "run-e", "run-f"]);
-
-  const errorLog = spyOn(console, "error").mockImplementation(() => {});
-  const diagnostic = spyOn(diagnostics, "reportDiagnostic").mockImplementation((message) => { console.error(message); });
-  try {
-    expect(runner.detachWaitedRun("run-b", "session-b")).toBe(false);
-    expect(errorLog).toHaveBeenCalledTimes(1);
-    expect(errorLog).toHaveBeenCalledWith(expect.stringContaining("run-b"));
-    expect(errorLog).toHaveBeenCalledWith(expect.stringContaining("broken detach"));
-
-    runner.registerWaitedRun("run-b", "session-b", () => { throw new Error("broken detach"); });
-    expect(runner.detachWaitedRuns("session-b")).toEqual(["run-e"]);
-  } finally {
-    diagnostic.mockRestore();
-    errorLog.mockRestore();
-  }
-  expect(detached).toEqual(["run-a", "run-d", "run-e"]);
-  expect(runner.waitedRunIds("session-b")).toEqual([]);
-  expect(runner.detachWaitedRuns("session-b")).toEqual([]);
-});
-
 function controllableDelay(): {
   delay: (ms: number) => Promise<void>;
   calls: () => number;
@@ -309,8 +265,8 @@ test("follow-ups fork immutable source sessions into independent new runs", asyn
     followUpOf: { runId: "run-source", childId: "source-child" },
   });
 
-  const first = runner.spawnRun([followUp("first continuation")], parent)[0]!;
-  const second = runner.spawnRun([followUp("second continuation")], parent)[0]!;
+  const first = runner.spawnRun(followUp("first continuation"), parent);
+  const second = runner.spawnRun(followUp("second continuation"), parent);
   const [firstResult, secondResult] = await Promise.all([first.result, second.result]);
 
   expect(readFileSync(sourceSession).equals(sourceBytes)).toBe(true);
@@ -392,7 +348,7 @@ test("structured capture repair reads the newest assistant result", async () => 
   expect(result.usage).toMatchObject({ input: 4, output: 6, turns: 2 });
 });
 
-test("spawn observers see a durably registered fan-out before children start", async () => {
+test("spawn observers see a durably registered child before it starts", async () => {
   let buildStarted = false;
   const resolved: ResolvedSpec = { provider: "test", modelId: "tiny", thinkingLevel: "off", tools: [], cwd: "/tmp", label: "observed" };
   const session = {
@@ -404,15 +360,15 @@ test("spawn observers see a durably registered fan-out before children start", a
   let observations = 0;
   const unsubscribe = runner.subscribeSpawns((run) => {
     observations += 1;
+    // The child is persisted in run.json before its build ever starts.
     expect(buildStarted).toBe(false);
     expect(run.parentSessionId).toBe("observer-parent");
-    expect(run.handles).toHaveLength(2);
-    const record = JSON.parse(readFileSync(join(run.runDir, "run.json"), "utf8")) as { children: unknown[] };
-    expect(record.children).toHaveLength(2);
+    const record = JSON.parse(readFileSync(join(run.runDir, "run.json"), "utf8")) as { children: Array<{ id: string }> };
+    expect(record.children.some((child) => child.id === run.handle.id)).toBe(true);
   });
 
-  const handles = runner.spawnRun([{ prompt: "one" }, { prompt: "two" }], parent);
-  await Promise.all(handles.map((handle) => handle.result));
+  const handle = runner.spawnRun({ prompt: "one" }, parent);
+  await handle.result;
   expect(observations).toBe(1);
 
   unsubscribe();
@@ -1471,7 +1427,7 @@ test("workflow children dispose on completion", async () => {
     kind: "workflow",
   });
   store.startWorkflowGeneration("return null;\n", undefined);
-  const handle = runner.spawnRun([{ prompt: "x" }], parent, { runId: "workflow-disposal", store })[0]!;
+  const handle = runner.spawnRun({ prompt: "x" }, parent, { runId: "workflow-disposal", store });
 
   await handle.result;
   await new Promise((resolve) => setTimeout(resolve, 0));

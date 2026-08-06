@@ -49,12 +49,12 @@ function defaultDelay(ms: number): Promise<void> {
   });
 }
 
-/** Observational handoff emitted after a full fan-out is registered but before any child starts. */
+/** Observational handoff emitted after a child is registered but before it starts. */
 export interface SpawnedRun {
   runId: string;
   runDir: string;
   parentSessionId: string;
-  handles: readonly SubagentHandle[];
+  handle: SubagentHandle;
 }
 
 /** Child telemetry without a Handle reference, safe for long-lived aggregate observers. */
@@ -274,7 +274,6 @@ export class SubagentRunner {
     execution: Promise<unknown>;
     isExpectedStop: (error: unknown) => boolean;
   }>();
-  private waitedRuns = new Map<string, { parentSessionId: string; detach: () => boolean }>();
   private childCounter = 0;
   private finalizedRuns = new Set<string>();
   private deliveredRuns = new Set<string>();
@@ -368,10 +367,10 @@ export class SubagentRunner {
   }
 
   spawn(spec: SubagentSpec, parent: ParentContext): SubagentHandle {
-    return this.spawnRun([spec], parent)[0]!;
+    return this.spawnRun(spec, parent);
   }
 
-  spawnRun(specs: ChildSpawnSpec[], parent: ParentContext, options: SpawnRunOptions = {}): SubagentHandle[] {
+  spawnRun(spec: ChildSpawnSpec, parent: ParentContext, options: SpawnRunOptions = {}): SubagentHandle {
     const runId = options.runId ?? `run-${Date.now().toString(36)}-${randomUUID().replaceAll("-", "").slice(0, 16)}`;
     const existingStore = this.stores.get(runId);
     const store = options.store ?? existingStore
@@ -382,17 +381,15 @@ export class SubagentRunner {
       if (ownsUnregisteredStore) store.releaseOwnership();
       throw new Error(`Run ${runId} has no active delivery generation`);
     }
-    const handles = specs.map((spec) => {
-      // Strip the kind prefix, whatever it is: slice(4) assumed "run-" and
-      // turned workflow run ids into "subagent-flow-..." child ids.
-      const id = `subagent-${runId.replace(/^[a-z]+-/, "")}-${this.nonce}-${(++this.childCounter).toString(36)}`;
-      return new Handle(id, spec, runId, store.runDir, identity.generation, store, this, parent);
-    });
-    // Persist the full fan-out before any child starts. If ownership was lost
-    // midway, no unreturned child can run as an orphan and no fenced store is
+    // Strip the kind prefix, whatever it is: slice(4) assumed "run-" and
+    // turned workflow run ids into "subagent-flow-..." child ids.
+    const id = `subagent-${runId.replace(/^[a-z]+-/, "")}-${this.nonce}-${(++this.childCounter).toString(36)}`;
+    const handle = new Handle(id, spec, runId, store.runDir, identity.generation, store, this, parent);
+    // Persist the child before it starts. If ownership was lost, the
+    // unreturned child cannot run as an orphan and no fenced store is
     // retained in the runner registry.
     try {
-      for (const handle of handles) store.addChild(handle.id, handle.spec, handle.followUpOf);
+      store.addChild(handle.id, handle.spec, handle.followUpOf);
     } catch (error) {
       if (ownsUnregisteredStore) store.releaseOwnership();
       throw error;
@@ -401,14 +398,12 @@ export class SubagentRunner {
     if (tracked) {
       tracked.retainAfterDelivery ||= options.store !== undefined;
       tracked.ownsRun = () => store.ownsRun;
-      for (const handle of handles) {
-        foldProjection(tracked.projection, {
-          type: "child",
-          id: handle.id,
-          spec: handle.spec,
-          followUpOf: handle.followUpOf,
-        });
-      }
+      foldProjection(tracked.projection, {
+        type: "child",
+        id: handle.id,
+        spec: handle.spec,
+        followUpOf: handle.followUpOf,
+      });
     } else {
       this.projections.set(runId, {
         projection: projectRunSnapshot(readRunSnapshot(store.runDir), runId),
@@ -417,18 +412,15 @@ export class SubagentRunner {
       });
     }
     this.stores.set(runId, store);
-    for (const handle of handles) this.handles.set(handle.id, handle);
+    this.handles.set(handle.id, handle);
     this.notifySpawn({
       runId,
       runDir: store.runDir,
       parentSessionId: parent.ctx.sessionManager.getSessionId(),
-      handles,
+      handle,
     });
-    for (const handle of handles) {
-      const startup = this.start(handle, store);
-      handle.trackStartup(startup);
-    }
-    return handles;
+    handle.trackStartup(this.start(handle, store));
+    return handle;
   }
 
   get(id: string): SubagentHandle | undefined { return this.handles.get(id); }
@@ -505,39 +497,6 @@ export class SubagentRunner {
     this.runControllers.set(runId, { controller, parentSessionId, execution, isExpectedStop });
   }
   unregisterRunController(runId: string): void { this.runControllers.delete(runId); }
-  /**
-   * A wait-mode tool call registers itself so /background and the navigator can claim and detach it.
-   * The callback must be synchronous, must not throw after claiming, and returns whether it claimed the waiting run.
-   */
-  registerWaitedRun(runId: string, parentSessionId: string, detach: () => boolean): void {
-    this.waitedRuns.set(runId, { parentSessionId, detach });
-  }
-  unregisterWaitedRun(runId: string): void { this.waitedRuns.delete(runId); }
-  /** Detach one waited run owned by a session. Returns whether the callback claimed it. */
-  detachWaitedRun(runId: string, parentSessionId: string): boolean {
-    const waited = this.waitedRuns.get(runId);
-    if (!waited || waited.parentSessionId !== parentSessionId) return false;
-    this.waitedRuns.delete(runId);
-    try {
-      return waited.detach();
-    } catch (error) {
-      reportDiagnostic(`[subagent-workflow] waited run ${runId} detach callback failed: ${errorMessage(error)}`);
-      return false;
-    }
-  }
-  /** Detach every waited run belonging to a session. Returns the successfully claimed runIds. */
-  detachWaitedRuns(parentSessionId: string): string[] {
-    const detached: string[] = [];
-    for (const [runId, waited] of this.waitedRuns) {
-      if (waited.parentSessionId !== parentSessionId) continue;
-      if (this.detachWaitedRun(runId, parentSessionId)) detached.push(runId);
-    }
-    return detached;
-  }
-  /** RunIds owned by a session and blocked in a wait-mode tool call in THIS process. */
-  waitedRunIds(parentSessionId: string): string[] {
-    return [...this.waitedRuns].filter(([, waited]) => waited.parentSessionId === parentSessionId).map(([runId]) => runId);
-  }
   /** Stop an entire run and wait for its workflow teardown or direct children. */
   async stopRun(runId: string): Promise<void> {
     const registered = this.runControllers.get(runId);

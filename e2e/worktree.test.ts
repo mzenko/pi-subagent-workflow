@@ -16,7 +16,7 @@ test.skipIf(!process.env.RUN_E2E)("worktree child returns a patch and leaves the
   git("commit", "-qm", "init");
 
   const output = await runPi(
-    'Call subagent with wait true, isolation "worktree", and prompt "create a file named note.txt containing exactly: from-child".',
+    'Call subagent with isolation "worktree" and prompt "create a file named note.txt containing exactly: from-child".',
     repo,
   );
   const unescaped = output.replace(/\\+/g, "");

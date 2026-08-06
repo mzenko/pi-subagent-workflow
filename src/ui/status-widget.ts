@@ -53,8 +53,7 @@ type WidgetCtx = Pick<ExtensionContext, "ui" | "hasUI">;
 
 interface TrackedRun {
   kind: "subagent" | "workflow";
-  fanout: boolean;
-  /** Workflow meta name, or the first spec's label for direct spawns. */
+  /** Sanitized display label: workflow meta name, or the child's label for a direct spawn. */
   label: string;
   /** Declared phase skeleton (workflow runs only). */
   phases: WorkflowPhase[];
@@ -78,11 +77,6 @@ export interface WidgetRunView {
   tokens: number;
 }
 
-function runLabel(run: Pick<TrackedRun, "kind" | "fanout" | "label" | "handles">): string {
-  if (run.kind === "workflow") return sanitizeTerminalText(run.label);
-  if (run.fanout) return `fan-out ×${run.handles.length}`;
-  return sanitizeTerminalText(childLabel(run.handles[0]!.spec));
-}
 
 function phaseView(run: Pick<TrackedRun, "kind" | "phases" | "currentPhase">): string | undefined {
   if (run.kind !== "workflow" || !run.currentPhase) return undefined;
@@ -176,13 +170,12 @@ export class SubagentStatusWidget {
     this.setCtx(ctx);
     const existing = this.runs.get(started.runId);
     if (existing) {
-      existing.label = started.name;
+      existing.label = sanitizeTerminalText(started.name);
       existing.phases = started.phases;
     } else {
       this.runs.set(started.runId, {
         kind: "workflow",
-        fanout: false,
-        label: started.name,
+        label: sanitizeTerminalText(started.name),
         phases: started.phases,
         currentPhase: started.phases[0]?.title,
         handles: [],
@@ -199,13 +192,12 @@ export class SubagentStatusWidget {
   private observeSpawn(spawned: SpawnedRun): void {
     const run = this.runs.get(spawned.runId);
     if (!run || run.kind !== "workflow") return;
-    for (const handle of spawned.handles) {
-      if (run.seenHandles.has(handle.id)) continue;
-      run.seenHandles.add(handle.id);
-      run.handles.push(handle);
-      run.unsubscribers.push(handle.subscribe((event) => this.onEvent(spawned.runId, run.tokens, event)));
-      if (handle.spec.phase !== undefined) run.currentPhase = handle.spec.phase;
-    }
+    const handle = spawned.handle;
+    if (run.seenHandles.has(handle.id)) return;
+    run.seenHandles.add(handle.id);
+    run.handles.push(handle);
+    run.unsubscribers.push(handle.subscribe((event) => this.onEvent(spawned.runId, run.tokens, event)));
+    if (handle.spec.phase !== undefined) run.currentPhase = handle.spec.phase;
     this.safeUpdate();
   }
 
@@ -216,23 +208,21 @@ export class SubagentStatusWidget {
   }
 
   /** Register a spawned run for live display. No-op without dialog-capable UI. */
-  track(runId: string, handles: readonly SubagentHandle[], fanout: boolean, ctx: WidgetCtx): void {
+  track(runId: string, handle: SubagentHandle, ctx: WidgetCtx): void {
     if (!ctx.hasUI) return;
     this.setCtx(ctx);
     const tokens = new Map<string, number>();
-    const unsubscribers = handles.map((handle) =>
-      handle.subscribe((event) => this.onEvent(runId, tokens, event)),
-    );
     this.runs.set(runId, {
       kind: "subagent",
-      fanout,
-      label: "",
+      // Computed once: the label is fixed for the run's life, and childLabel
+      // rescans the whole prompt - not worth repeating on every repaint.
+      label: sanitizeTerminalText(childLabel(handle.spec)),
       phases: [],
-      handles: [...handles],
-      seenHandles: new Set(handles.map((handle) => handle.id)),
-      startedAt: Math.min(...handles.map((handle) => handle.startedAt)),
+      handles: [handle],
+      seenHandles: new Set([handle.id]),
+      startedAt: handle.startedAt,
       tokens,
-      unsubscribers,
+      unsubscribers: [handle.subscribe((event) => this.onEvent(runId, tokens, event))],
     });
     this.safeUpdate();
   }
@@ -297,7 +287,7 @@ export class SubagentStatusWidget {
       }
       views.push({
         kind: run.kind,
-        label: runLabel(run),
+        label: run.label,
         phase: phaseView(run),
         counts: countStatuses(run.handles.map((handle) => handle.status)),
         startedAt: run.startedAt,

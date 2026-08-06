@@ -16,7 +16,6 @@ export interface RunSummary {
   /** Epoch ms; used for newest-first ordering. */
   createdAt: number;
   label: string;
-  fanout: boolean;
   status: SubagentStatus;
   done: number;
   total: number;
@@ -123,7 +122,6 @@ export function corruptRunSummary(runDir: string, runId: string, label = "unread
     kind: "subagent",
     createdAt: mtimeMs(runDir),
     label,
-    fanout: false,
     status: "failed",
     done: 0,
     total: 0,
@@ -261,7 +259,6 @@ function buildSnapshotSummary(
       terminalStatus: events?.terminalStatus,
     };
   });
-  const fanout = kind === "subagent" && children.length > 1;
   const counts = countStatuses(statuses);
   return {
     summary: {
@@ -269,8 +266,7 @@ function buildSnapshotSummary(
       runDir,
       kind,
       createdAt: parseTimestamp(run.createdAt) || mtimeMs(runDir),
-      label: labelForRun(kind, fanout, run.children, snapshot, options),
-      fanout,
+      label: labelForRun(kind, run.children, snapshot, options),
       status: runStatusFor(status, ids),
       done: counts.done,
       total: children.length,
@@ -432,7 +428,7 @@ function refreshProjection(projection: RunProjection): void {
   refreshSummary(summary, detail.children);
   if (summary.kind === "subagent") {
     detail.status = summary.status;
-    summary.label = summary.fanout ? `fan-out ×${detail.children.length}` : detail.children[0]?.label ?? "subagent";
+    summary.label = detail.children[0]?.label ?? "subagent";
     detail.label = summary.label;
   }
 }
@@ -447,18 +443,15 @@ function refreshSummary(summary: RunSummary, children: readonly Pick<ChildRow, "
   summary.failed = counts.failed;
   summary.aborted = counts.aborted;
   summary.tokens = children.reduce((total, child) => total + child.tokens, 0);
-  summary.fanout = summary.kind === "subagent" && statuses.length > 1;
 }
 
 function labelForRun(
   kind: RunKind,
-  fanout: boolean,
   children: NonNullable<RunRecordFile["children"]>,
   snapshot: RunSnapshot,
   options: SnapshotProjectionOptions,
 ): string {
   if (kind === "workflow") return options.workflowLabel ?? workflowName(snapshot, options.describeWorkflow) ?? "workflow";
-  if (fanout) return `fan-out ×${children.length}`;
   const child = children[0];
   return child ? persistedChildLabel(child, "subagent") : "subagent";
 }

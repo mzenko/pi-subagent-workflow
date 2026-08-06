@@ -8,7 +8,7 @@ test.skipIf(!process.env.RUN_E2E)("two-phase workflow persists phases and journa
 const found = await agent('Return exactly two color names', { schema: { type: 'object', properties: { colors: { type: 'array', items: { type: 'string' }, minItems: 2, maxItems: 2 } }, required: ['colors'], additionalProperties: false } });
 phase('Audit');
 return parallel(found.colors.map(color => () => agent('Describe the color ' + color)));`;
-  const output = await runPi(`Call workflow with wait true using this exact script: ${JSON.stringify(script)}`);
+  const output = await runPi(`Call workflow with this exact script: ${JSON.stringify(script)}`);
   const runDir = output.match(/"runDir"\s*:\s*"([^"]+)"/)?.[1]?.replaceAll("\\/", "/");
   expect(runDir).toBeDefined();
   const run = JSON.parse(await readFile(join(runDir!, "run.json"), "utf8"));
@@ -28,7 +28,7 @@ return parallel(found.colors.map(color => () => agent('Describe the color ' + co
 test.skipIf(!process.env.RUN_E2E)("workflow reads args and persists a derived return value", async () => {
   const script = `export const meta = { name: 'sum-args', description: 'Sum two numbers from args', phases: [] };
 return { total: args.a + args.b };`;
-  const output = await runPi(`Call workflow with wait true, args {"a":19,"b":23}, and this exact script: ${JSON.stringify(script)}`);
+  const output = await runPi(`Call workflow with args {"a":19,"b":23} and this exact script: ${JSON.stringify(script)}`);
   const runDir = output.match(/"runDir"\s*:\s*"([^"]+)"/)?.[1]?.replaceAll("\\/", "/");
   expect(runDir).toBeDefined();
   const result = JSON.parse(await readFile(join(runDir!, "result.json"), "utf8"));
@@ -45,7 +45,7 @@ test.skipIf(!process.env.RUN_E2E)("pipeline passes (item, previous) to stages an
 return pipeline(['sierra', 'tango'],
   (word) => agent('Reply with exactly this text and nothing else: ' + word.toUpperCase() + '-7'),
   (word, previous) => ({ word, fromPrevious: String(previous).trim() }));`;
-  const output = await runPi(`Call workflow with wait true using this exact script: ${JSON.stringify(script)}`);
+  const output = await runPi(`Call workflow with this exact script: ${JSON.stringify(script)}`);
   const runDir = output.match(/"runDir"\s*:\s*"([^"]+)"/)?.[1]?.replaceAll("\\/", "/");
   expect(runDir).toBeDefined();
   const result = JSON.parse(await readFile(join(runDir!, "result.json"), "utf8")) as Array<{ word: string; fromPrevious: string }>;

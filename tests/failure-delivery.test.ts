@@ -107,17 +107,17 @@ test("chunkDeliveryText directly covers boundaries without splitting surrogate p
 });
 
 test("subagent failure delivery includes identity, error, and respawn recovery", () => {
-  const text = formatDelivery("run-1", "/runs/run-1", [{
+  const text = formatDelivery("run-1", "/runs/run-1", {
     id: "child-1",
     status: "failed",
     text: "",
     error: "model unavailable",
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
     resolved: { provider: "test", modelId: "test", thinkingLevel: "off", tools: [], cwd: "/work", label: "Audit routes" },
-  }]);
+  });
   expect(text).toContain("Child child-1 (Audit routes): failed");
-  expect(text).toContain("1 failed child (Audit routes): model unavailable");
-  expect(text).toContain("Recovery: respawn failed children");
+  expect(text).toContain("Failed child child-1 (Audit routes): model unavailable");
+  expect(text).toContain("Recovery: respawn the child");
 });
 
 test("aborted subagent deliveries report aborts without recommending respawn", () => {
@@ -128,15 +128,11 @@ test("aborted subagent deliveries report aborts without recommending respawn", (
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
     resolved: { provider: "test", modelId: "test", thinkingLevel: "off" as const, tools: [], cwd: "/work", label: "Cancelled work" },
   };
-  const completed = { ...aborted, id: "child-completed", status: "completed" as const, text: "done" };
 
-  const single = formatDelivery("run-aborted", "/runs/run-aborted", [aborted]);
+  const single = formatDelivery("run-aborted", "/runs/run-aborted", aborted);
   expect(single).toContain("Status: aborted");
+  expect(single).toContain("Aborted child child-aborted (Cancelled work)");
   expect(single).not.toContain("Recovery: respawn");
-
-  const mixed = formatDelivery("run-mixed", "/runs/run-mixed", [completed, aborted]);
-  expect(mixed).toContain("Status: completed, 1 aborted");
-  expect(mixed).not.toContain("Recovery: respawn");
 });
 
 test("completed workflow delivery groups failed children with one resume recovery", () => {
@@ -323,7 +319,7 @@ test("a truncated workflow delivery points to the persisted result artifact", ()
 });
 
 test("a degraded oversized subagent result hedges its events artifact marker", () => {
-  const text = formatDelivery("run-oversized", "/runs/run-oversized", [{
+  const text = formatDelivery("run-oversized", "/runs/run-oversized", {
     id: "child-oversized",
     status: "failed",
     sessionFile: "/sessions/child-oversized.jsonl",
@@ -334,12 +330,12 @@ test("a degraded oversized subagent result hedges its events artifact marker", (
     error: "model unavailable",
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
     resolved: { provider: "test", modelId: "test", thinkingLevel: "off", tools: [], cwd: "/work", label: "Audit routes" },
-  }], "events write failed");
+  }, "events write failed");
 
   expect(text.length).toBe(DELIVERY_ENVELOPE_BUDGET);
   expect(text).toContain("Child child-oversized (Audit routes): failed");
-  expect(text).toContain("1 failed child (Audit routes): model unavailable");
-  expect(text).toContain("Recovery: respawn failed children");
+  expect(text).toContain("Failed child child-oversized (Audit routes): model unavailable");
+  expect(text).toContain("Recovery: respawn the child");
   expect(text).toContain("Warning: run persistence degraded (events write failed)");
   expect(text).toContain("Run record: /runs/run-oversized/run.json");
   expect(text).toContain("Child child-oversized session: /sessions/child-oversized.jsonl");
@@ -347,47 +343,27 @@ test("a degraded oversized subagent result hedges its events artifact marker", (
 });
 
 test("a truncated subagent result without a session file points to events.jsonl", () => {
-  const text = formatDelivery("run-events", "/runs/run-events", [{
+  const text = formatDelivery("run-events", "/runs/run-events", {
     id: "child-events",
     status: "completed",
     text: "z".repeat(20_000),
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
     resolved: { provider: "test", modelId: "test", thinkingLevel: "off", tools: [], cwd: "/work", label: "Audit routes" },
-  }]);
+  });
 
   const marker = text.split("\n").find((line) => line.startsWith("[truncated -"));
   expect(marker).toBe("[truncated - full result remains available via /runs/run-events/events.jsonl]");
   expect(marker).not.toContain("run.json");
 });
 
-test("a 16-child delivery drops auxiliary sessions before required markers and records", () => {
-  const results = Array.from({ length: 16 }, (_, index) => ({
-    id: `child-${index + 1}`,
-    status: "completed" as const,
-    sessionFile: `/sessions/${"long-path/".repeat(240)}child-${index + 1}.jsonl`,
-    text: "z".repeat(2_000),
-    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
-    resolved: { provider: "test", modelId: "test", thinkingLevel: "off" as const, tools: [], cwd: "/work", label: `Child ${index + 1}` },
-  }));
-  const text = formatDelivery("run-fanout", "/runs/run-fanout", results);
-  const sessionLines = text.split("\n").filter((line) => /^Child child-\d+ session:/.test(line));
-
-  expect(text.length).toBeLessThanOrEqual(DELIVERY_ENVELOPE_BUDGET);
-  expect(text).toContain("[fixed sections truncated]");
-  expect(text).toContain("[truncated - full result remains available via /runs/run-fanout/events.jsonl]");
-  expect(text).toContain("Run record: /runs/run-fanout/run.json");
-  expect(sessionLines.length).toBeLessThan(results.length);
-  expect(text).not.toContain("Child child-16 session:");
-});
-
 test("a small subagent result passes through the envelope whole", () => {
-  const text = formatDelivery("run-small", "/runs/run-small", [{
+  const text = formatDelivery("run-small", "/runs/run-small", {
     id: "child-small",
     status: "completed",
     text: "all done",
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
     resolved: { provider: "test", modelId: "test", thinkingLevel: "off", tools: [], cwd: "/work", label: "Small task" },
-  }]);
+  });
 
   expect(text).not.toContain("[truncated");
   expect(text).toContain('"text":"all done"');
