@@ -7,13 +7,29 @@
  * above text - so an inline image under the /agents panel always paints over
  * it, and pi-tui re-transmits the placement on every panel repaint. Upstream
  * declined to blank covered image blocks in compositeOverlays (pi issue
- * #6995), so this patches the mounted TUI's Container.render while an overlay
- * of ours is up: image lines become empty lines, pi-tui's own differential
- * pass then deletes the kitty placement, and the overlay composites normally.
- * On unmount the patch is removed and the same differential pass re-transmits
- * the image.
+ * #6995), so while an overlay of ours is up this installs a render wrapper on
+ * the live renderer that blanks viewport image lines: pi-tui's own
+ * differential pass then deletes the kitty placement, the overlay composites
+ * normally, and unmounting re-transmits the image the same way.
  *
- * Two deliberate scope limits:
+ * The `tui` handed to ctx.ui.custom factories is not necessarily the renderer
+ * itself. Since pi 0.84 it is a stable Proxy (createInteractiveTuiReference)
+ * whose property reads return fresh forwarding closures that re-resolve the
+ * CURRENT method at call time - so capturing `tui.render` and calling it from
+ * a wrapper assigned back onto `tui` recurses into the wrapper itself, and
+ * the proxy has no deleteProperty/getOwnPropertyDescriptor traps, so `delete`
+ * and Object.hasOwn silently miss the real renderer. Both are avoided by
+ * construction here:
+ * - The original is taken from the PROTOTYPE CHAIN (the proxy forwards
+ *   getPrototypeOf), which yields the pristine class method - never a
+ *   forwarding closure, never an installed wrapper.
+ * - The wrapper is a plain method using `this`, so it acts on whichever
+ *   renderer pi invokes it on.
+ * - Restore assigns the prototype method back (assignment forwards through
+ *   the proxy; an own property equal to the prototype method is inert), so
+ *   repeated open/close cycles never stack wrappers.
+ *
+ * Three deliberate scope limits:
  * - Viewport only: blanking an image line above the viewport moves
  *   firstChanged above prevViewportTop, which sends pi-tui down its
  *   fullRender(true) path - a screen clear that erases the terminal's
@@ -22,6 +38,11 @@
  * - ALL viewport images are blanked, not only rows the panel covers:
  *   extensions cannot see overlay geometry, and the panel covers ~90% of the
  *   screen anyway.
+ * - Not in fullscreen (TuiAltScreen, pi 0.84 tui-mode setting): its render
+ *   loop draws through a layout root rather than this.render, so a wrapper
+ *   here would never be invoked. The image-over-panel bug does exist there;
+ *   fixing it would mean patching a different seam with its own hazards, for
+ *   a non-default mode. Suppression no-ops instead of pretending.
  *
  * Delete this file once pi-tui blanks covered image blocks itself.
  */
@@ -29,15 +50,26 @@
 import type { TUI } from "@earendil-works/pi-tui";
 
 // pi-tui does not export its isImageLine; these are the two escape prefixes
-// it recognizes (kitty APC and iTerm2 OSC 1337 inline files).
-const KITTY = "\u001b_G";
-const ITERM2 = "\u001b]1337;File=";
+// it recognizes (kitty APC and iTerm2 OSC 1337 inline files). The ESC byte is
+// spelled out so the prefixes cannot match ordinary text.
+const ESC = String.fromCharCode(0x1b);
+const KITTY = `${ESC}_G`;
+const ITERM2 = `${ESC}]1337;File=`;
+
+type Render = (width: number) => string[];
+
+/** The class render method, found by walking the (proxy-forwarded) prototype chain. */
+function prototypeRender(tui: TUI): Render | undefined {
+  for (let proto = Object.getPrototypeOf(tui); proto; proto = Object.getPrototypeOf(proto)) {
+    const descriptor = Object.getOwnPropertyDescriptor(proto, "render");
+    if (typeof descriptor?.value === "function") return descriptor.value as Render;
+  }
+  return undefined;
+}
 
 interface PatchEntry {
   depth: number;
-  original: (width: number) => string[];
-  /** Whether `render` was an own property before patching (it normally is not). */
-  hadOwnRender: boolean;
+  original: Render;
 }
 
 const patched = new WeakMap<TUI, PatchEntry>();
@@ -47,30 +79,35 @@ const patched = new WeakMap<TUI, PatchEntry>();
  * so nested or overlapping overlays share one patch.
  */
 export function suppressInlineImages(tui: TUI): () => void {
-  // Best-effort mitigation of a cosmetic bug: a host without a patchable
-  // render (test fakes; a future pi-tui that reshapes the class) just keeps
-  // its images.
-  if (typeof tui.render !== "function") return () => {};
+  // Fullscreen never dispatches through this.render (see scope limits above);
+  // installing a wrapper there would be inert, so do not.
+  if ((tui as { mode?: unknown }).mode === "fullscreen") return () => {};
   let entry = patched.get(tui);
   if (!entry) {
-    // Keep the raw method and call-bind it per invocation. Capturing a
-    // .bind() and assigning it back on restore would leave a bound wrapper as
-    // an own property, and the next mount would wrap that wrapper - one extra
-    // frame of call depth per open/close cycle, forever.
-    const original = tui.render as (width: number) => string[];
-    entry = { depth: 0, original, hadOwnRender: Object.hasOwn(tui, "render") };
+    const original = prototypeRender(tui);
+    // Best-effort mitigation of a cosmetic bug: a host whose render is not an
+    // ordinary prototype method (test fakes, future pi-tui shapes) just keeps
+    // its images.
+    if (!original) return () => {};
+    entry = { depth: 0, original };
     patched.set(tui, entry);
-    (tui as { render: (width: number) => string[] }).render = (width: number) => {
-      const lines = original.call(tui, width);
-      // Self-heal: pi's own teardown paths (e.g. /reload) hide overlays
-      // without running component dispose, which would leave this patch
-      // active forever. With no overlay mounted there is nothing to protect,
-      // so pass through untouched.
-      if (typeof tui.hasOverlay === "function" && !tui.hasOverlay()) return lines;
-      const start = Math.max(0, lines.length - (tui.terminal?.rows ?? 24));
-      for (let index = start; index < lines.length; index += 1) {
-        const line = lines[index]!;
-        if (line.includes(KITTY) || line.includes(ITERM2)) lines[index] = "";
+    (tui as { render: Render }).render = function (this: TUI, width: number): string[] {
+      const lines = original.call(this, width);
+      try {
+        // Self-heal: pi's own teardown paths (e.g. /reload) hide overlays
+        // without running component dispose, which would leave this wrapper
+        // active forever. With no overlay mounted there is nothing to
+        // protect, so pass through untouched.
+        if (typeof this.hasOverlay === "function" && !this.hasOverlay()) return lines;
+        const start = Math.max(0, lines.length - (this.terminal?.rows ?? 24));
+        for (let index = start; index < lines.length; index += 1) {
+          const line = lines[index]!;
+          if (line.includes(KITTY) || line.includes(ITERM2)) lines[index] = "";
+        }
+      } catch {
+        // This runs inside pi's render loop, where a throw kills the process.
+        // No cosmetic touch-up is worth that; fall through with whatever the
+        // real render produced.
       }
       return lines;
     };
@@ -84,13 +121,10 @@ export function suppressInlineImages(tui: TUI): () => void {
     if (!current) return;
     current.depth -= 1;
     if (current.depth > 0) return;
-    if (current.hadOwnRender) {
-      (tui as { render: (width: number) => string[] }).render = current.original;
-    } else {
-      // The method came from the prototype; removing the own property
-      // restores it without leaving any wrapper behind.
-      delete (tui as { render?: (width: number) => string[] }).render;
-    }
+    // Assignment, not delete: pi's TUI reference proxy forwards set but has
+    // no deleteProperty trap. An own property holding the prototype method is
+    // behaviorally identical to no own property at all.
+    (tui as { render: Render }).render = current.original;
     patched.delete(tui);
     // The restored render changes the blanked lines back; request the pass
     // that re-transmits the image.
