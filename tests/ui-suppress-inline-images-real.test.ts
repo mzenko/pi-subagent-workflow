@@ -46,7 +46,7 @@ const scrollbackRewrites = (frame: string): number => (frame.match(/\x1b\[3J/g) 
 type Renderer = TuiAltScreen | TuiMainScreen;
 
 /** Render an image, open the panel over it, repaint, and close it; return each frame. */
-function cycle(Kind: new (terminal: Terminal) => Renderer, fix: boolean, trailingLines = 4) {
+function cycle(Kind: new (terminal: Terminal) => Renderer, fix: boolean, trailingLines = 4, disposeBeforeHide = true) {
   const { terminal, take } = recordingTerminal();
   const tui = new Kind(terminal);
   const frame = () => { (tui as unknown as { doRender(): void }).doRender(); return take(); };
@@ -59,7 +59,7 @@ function cycle(Kind: new (terminal: Terminal) => Renderer, fix: boolean, trailin
   const restore = fix ? suppressInlineImages(tui as never) : () => {};
   const open = frame();
   const repaint = frame();
-  restore();
+  if (disposeBeforeHide) restore();
   overlay.hide();
   const closed = frame();
   tui.stop();
@@ -88,6 +88,13 @@ describe.each(RENDERERS)("%s", (_name, Kind) => {
     // re-placement after close would draw nothing: the data must be re-sent.
     expect(transmits(frames.closed)).toBe(true);
   });
+});
+
+test("an overlay hidden without its disposer still gets its images re-sent", () => {
+  // pi's own teardown (e.g. /reload) hides overlays without running dispose.
+  const frames = cycle(TuiAltScreen, true, 4, false);
+  expect(places(frames.open)).toBe(false);
+  expect(transmits(frames.closed)).toBe(true);
 });
 
 describe("regular mode, image anchored above the viewport", () => {

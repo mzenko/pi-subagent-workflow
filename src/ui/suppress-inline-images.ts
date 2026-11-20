@@ -200,12 +200,17 @@ export function suppressInlineImages(tui: TUI): () => void {
       // Self-heal: pi's own teardown paths (e.g. /reload) hide overlays
       // without running component dispose, which would leave this wrapper
       // active forever. With no overlay mounted there is nothing to protect,
-      // so pass through untouched.
+      // so pass through untouched - after making pi re-send what was hidden,
+      // since the disposer that would have done it may never run.
       let active = false;
       let input = lines;
       try {
         active = typeof this.hasOverlay !== "function" || this.hasOverlay();
         if (active) input = blankViewportImageLines(lines, termHeight);
+        else if (hidden.size > 0) {
+          forgetUploads(this, hidden);
+          hidden.clear();
+        }
       } catch {
         // This runs inside pi's render loop, where a throw kills the process.
         // No cosmetic touch-up is worth that; composite the frame unchanged.
