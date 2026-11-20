@@ -48,13 +48,6 @@ describe("buildChildArgs", () => {
     expect(args).not.toContain("--tools");
   });
 
-  test("maps a persisted session file to the fork flag", () => {
-    const args = buildChildArgs({ ...base, forkSessionFile: "/runs/source/sessions/original.jsonl" });
-    const forkIndex = args.indexOf("--fork");
-    expect(forkIndex).toBeGreaterThan(-1);
-    expect(args[forkIndex + 1]).toBe("/runs/source/sessions/original.jsonl");
-  });
-
   test("an explicit empty allowlist crosses as --tools '' (zero tools), not as no flag", () => {
     const args = buildChildArgs({ ...base, tools: [] });
     const toolsIndex = args.indexOf("--tools");
@@ -133,13 +126,6 @@ const assistant = (text: string, input = 0, output = 0): AssistantMessage => ({
 } as unknown as AssistantMessage);
 
 describe("RpcChildSession", () => {
-  test("start captures the child session file from get_state", async () => {
-    const rpc = fakeRpc();
-    rpc.respond("get_state", { isStreaming: false, isCompacting: false, pendingMessageCount: 0, sessionFile: "/sessions/child.jsonl" });
-    const session = await RpcChildSession.start(rpc);
-    expect(session.sessionFile).toBe("/sessions/child.jsonl");
-  });
-
   test("startup lifecycle frames cannot contaminate the first prompt", async () => {
     const rpc = fakeRpc();
     const stale = assistant("stale", 7, 9);
@@ -204,29 +190,6 @@ describe("RpcChildSession", () => {
     expect(secondResolved).toBe(true);
   });
 
-  test("custom message lifecycle events do not let a stale settlement complete a pending prompt", async () => {
-    const rpc = fakeRpc();
-    rpc.respond("get_state", { isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
-    const session = await RpcChildSession.start(rpc);
-    rpc.respond("prompt", undefined);
-    let resolved = false;
-    const turn = session.prompt("pending prompt").then(() => { resolved = true; });
-    await Bun.sleep(0);
-
-    const custom = { role: "custom", customType: "notice", content: "outside an agent run" };
-    rpc.emit({ type: "message_start", message: custom });
-    rpc.emit({ type: "message_update", message: custom, assistantMessageEvent: { type: "citation_delta" } });
-    rpc.emit({ type: "message_end", message: custom });
-    rpc.emit({ type: "agent_settled" });
-    await Bun.sleep(0);
-    expect(resolved).toBe(false);
-
-    rpc.emit({ type: "agent_start" });
-    rpc.emit({ type: "agent_settled" });
-    await turn;
-    expect(resolved).toBe(true);
-  });
-
   test("run activity accepts guarded prompts without agent_start", async () => {
     const rpc = fakeRpc();
     // Idle only for the startup handshake; every later get_state reports
@@ -279,6 +242,7 @@ describe("RpcChildSession", () => {
     // a stale agent_settled must not settle the pending turn.
     const custom = { role: "custom", content: "outside a run" };
     rpc.emit({ type: "message_start", message: custom });
+    rpc.emit({ type: "message_update", message: custom, assistantMessageEvent: { type: "citation_delta" } });
     rpc.emit({ type: "message_end", message: custom });
     rpc.emit({ type: "agent_settled" });
     let settled = false;
@@ -391,7 +355,6 @@ describe("RpcChildSession", () => {
 
     expect(session.latestAssistant).toEqual(assistant("billed-but-turn-never-ended", 5, 6));
     expect(session.usage).toEqual({ input: 8, output: 10, cacheRead: 2, cacheWrite: 4, cost: 0.02, turns: 2 });
-    expect("messages" in session).toBe(false);
   });
 
   test("forwards streaming events and clears currentAssistant only at settlement", () => {

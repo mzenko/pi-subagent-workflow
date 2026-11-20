@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import {
-  confirmAutoApproval,
   formatSettings,
   handleSettingsCommand,
   parseNumericSetting,
@@ -57,8 +56,6 @@ test("settings list contains all approved fields and maintenance actions", () =>
     "action:clear-approvals",
     "action:reset",
   ]);
-  expect(items.find((item) => item.id === "agentTimeoutMinutes")?.submenu).toBeFunction();
-  expect(items.find((item) => item.id === "workflowApproval")?.submenu).toBeFunction();
 });
 
 test("finite settings show an explicit option list", () => {
@@ -109,9 +106,33 @@ test("numeric settings display their canonical ranges and sentinels", () => {
   }
 });
 
-test("auto approval uses a confirmation dialog instead of typed text", async () => {
-  expect(await confirmAutoApproval(context({ confirm: async () => true }))).toBe(true);
-  expect(await confirmAutoApproval(context({ confirm: async () => false }))).toBe(false);
+test("declining the auto-approval confirmation keeps the current approval mode", async () => {
+  initTheme(undefined, false);
+  const settings = store();
+  let overlays = 0;
+  let confirms = 0;
+  const ctx = context({
+    confirm: async () => { confirms += 1; return false; },
+    custom: async (factory: any) => {
+      overlays += 1;
+      if (overlays > 1) return undefined;
+      let result: unknown;
+      const component = await factory(
+        { requestRender: () => {} },
+        { fg: (_color: string, text: string) => text, bold: (text: string) => text },
+        {},
+        (value: unknown) => { result = value; },
+      );
+      component.handleInput("\u001b[B"); // Workflow approval.
+      component.handleInput("\r"); // Open explicit choices at "remember".
+      component.handleInput("\u001b[B"); // Auto-approve.
+      component.handleInput("\r");
+      return result;
+    },
+  });
+  await handleSettingsCommand("", ctx, services(settings));
+  expect(confirms).toBe(1);
+  expect(settings.get().workflowApproval).toBe("remember");
 });
 
 test("show reports effective values and path", async () => {

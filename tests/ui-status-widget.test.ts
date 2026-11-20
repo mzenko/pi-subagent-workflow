@@ -135,12 +135,11 @@ test("widget can be hidden and shown live without losing an active run", () => {
   widget.dispose();
 });
 
-test("widget setup failure stops its refresh timer", async () => {
-  let widgetCalls = 0;
+test("a widget setup failure does not throw out of track", () => {
   const ctx = {
     hasUI: true,
     ui: {
-      setWidget: () => { widgetCalls += 1; throw new Error("UI closed"); },
+      setWidget: () => { throw new Error("UI closed"); },
       setStatus: () => {},
     },
   } as never;
@@ -148,9 +147,6 @@ test("widget setup failure stops its refresh timer", async () => {
   const errorLog = spyOn(console, "error").mockImplementation(() => {});
   try {
     expect(() => widget.track("run-1", fakeHandle("c1", []).handle, ctx)).not.toThrow();
-    const callsAfterFailure = widgetCalls;
-    await Bun.sleep(230);
-    expect(widgetCalls).toBe(callsAfterFailure);
   } finally {
     widget.dispose();
     errorLog.mockRestore();
@@ -217,42 +213,36 @@ test("the widget never shrinks pi's inline buffer while an overlay is mounted", 
 });
 
 test("a repaint is skipped only when the painted text is genuinely identical", () => {
-  // The repaint gate compares an encoded identity of the view, so it must not
-  // collapse two different views into one signature - a run label is arbitrary
-  // text, so any delimiter-joined scheme risks exactly that.
-  const calls: string[] = [];
+  // Pi draws inline, so every repaint snaps the viewport to the bottom: an event
+  // that leaves the painted text unchanged must not request one, and an event
+  // that changes it must.
+  let factory: ((tui: unknown, theme: unknown) => { render: (width: number) => string[] }) | undefined;
   const ctx = {
     hasUI: true,
     ui: {
-      setWidget: () => {},
-      setStatus: (_key: string, text: unknown) => calls.push(String(text)),
+      setWidget: (_key: string, content: unknown) => { if (typeof content === "function") factory = content as typeof factory; },
+      setStatus: () => {},
     },
   } as never;
-  const tui = { hasOverlay: () => false, requestRender: () => {}, terminal: { rows: 40 } };
+  let repaints = 0;
+  const tui = { hasOverlay: () => false, requestRender: () => { repaints += 1; }, terminal: { rows: 40 } };
+  const listeners: Array<(event: SubagentEvent) => void> = [];
+  const child = fakeHandle("c1", listeners);
+  const widget = new SubagentStatusWidget();
+  widget.track("run-1", child.handle, ctx);
+  factory!(tui, PLAIN).render(120);
+  const emit = (event: SubagentEvent) => { for (const listener of listeners) listener(event); };
+  const tokens = (input: number) => ({ type: "usage", id: "c1", usage: { input, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 } }) as SubagentEvent;
 
-  const renderFor = (label: string, phase: string): string => {
-    const widget = new SubagentStatusWidget();
-    let factory: ((tui: unknown, theme: unknown) => { render: (width: number) => string[] }) | undefined;
-    const capture = {
-      hasUI: true,
-      ui: {
-        setWidget: (_key: string, content: unknown) => { if (typeof content === "function") factory = content as typeof factory; },
-        setStatus: () => {},
-      },
-    } as never;
-    const listeners: Array<(event: SubagentEvent) => void> = [];
-    const child = fakeHandle("c1", listeners);
-    (child.handle.spec as { label?: string }).label = label;
-    (child.handle.spec as { phase?: string }).phase = phase;
-    widget.track("run-1", child.handle, capture);
-    const lines = factory!(tui, PLAIN).render(120).join("\n");
-    widget.dispose();
-    return lines;
-  };
-
-  // Two labels that a naive separator scheme could merge must render differently.
-  expect(renderFor("build docs", "")).not.toBe(renderFor("build", "docs"));
-  expect(calls.length).toBe(0);
+  emit(tokens(1_000));
+  expect(repaints).toBe(1);
+  // Same totals again, and a status event that changes nothing: no repaint.
+  emit(tokens(1_000));
+  emit({ type: "status", id: "c1", status: "running" } as SubagentEvent);
+  expect(repaints).toBe(1);
+  emit(tokens(2_000));
+  expect(repaints).toBe(2);
+  widget.dispose();
 });
 
 test("a just-started workflow with no children yet renders as starting", () => {

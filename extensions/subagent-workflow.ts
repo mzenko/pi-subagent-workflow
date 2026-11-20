@@ -211,7 +211,7 @@ function claimCatchUpRuns(
   return claimed;
 }
 
-export function formatCatchUpMessage(runs: readonly CatchUpRun[]): string {
+function formatCatchUpMessage(runs: readonly CatchUpRun[]): string {
   const shown = runs.slice(0, CATCH_UP_RUN_CAP);
   const lines = shown.map((run) => [
     run.runId,

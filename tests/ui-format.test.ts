@@ -10,7 +10,6 @@ import {
   shortModel,
   SPINNER,
   spinnerFrame,
-  statusColor,
   statusGlyph,
 } from "../src/ui/format.js";
 
@@ -20,21 +19,19 @@ test("spinnerFrame advances with the clock and stays in range", () => {
   expect(spinnerFrame(100 * SPINNER.length)).toBe(SPINNER[0]);
 });
 
-test("statusColor maps each lifecycle state to a theme role", () => {
-  expect(statusColor("completed")).toBe("success");
-  expect(statusColor("failed")).toBe("error");
-  expect(statusColor("aborted")).toBe("warning");
-  expect(statusColor("running")).toBe("accent");
-  expect(statusColor("pending")).toBe("dim");
-});
-
-test("statusGlyph animates running only when requested", () => {
+test("statusGlyph animates running only when requested and colors each state", () => {
   expect(statusGlyph("running", PLAIN, 0, true)).toBe(SPINNER[0]);
   expect(statusGlyph("running", PLAIN, 0, false)).toBe("◆");
   expect(statusGlyph("completed", PLAIN, 0, false)).toBe("✓");
   expect(statusGlyph("failed", PLAIN, 0, false)).toBe("✗");
   expect(statusGlyph("aborted", PLAIN, 0, false)).toBe("⊘");
   expect(statusGlyph("pending", PLAIN, 0, false)).toBe("·");
+  const tagged = { fg: (color: string, text: string) => `<${color}>${text}`, bold: (text: string) => text };
+  expect(statusGlyph("completed", tagged, 0, false)).toBe("<success>✓");
+  expect(statusGlyph("failed", tagged, 0, false)).toBe("<error>✗");
+  expect(statusGlyph("aborted", tagged, 0, false)).toBe("<warning>⊘");
+  expect(statusGlyph("running", tagged, 0, false)).toBe("<accent>◆");
+  expect(statusGlyph("pending", tagged, 0, false)).toBe("<dim>·");
 });
 
 test("formatTokens is compact", () => {

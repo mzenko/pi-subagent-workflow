@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { PLAIN } from "../src/ui/format.js";
-import { bodyHeight, clampScroll, scriptOverlayLines } from "../src/ui/script-overlay.js";
+import { clampScroll, scriptOverlayLines } from "../src/ui/script-overlay.js";
 
 test("clampScroll keeps the window within bounds", () => {
   expect(clampScroll(-5, 100, 10)).toBe(0);
@@ -19,7 +19,7 @@ test("overlay renders exactly `height` rows with numbered, width-clamped body", 
   // Header, then body starting at line 1, then footer.
   expect(lines[0]).toContain("50 lines");
   expect(lines[1]).toContain("1  line-1");
-  expect(lines.at(-1)).toContain(`lines 1-${bodyHeight(height)} of 50`);
+  expect(lines.at(-1)).toContain("lines 1-10 of 50");
   expect(lines.every((line) => visibleWidth(line) <= 40)).toBe(true);
 });
 

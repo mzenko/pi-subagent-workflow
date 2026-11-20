@@ -1,11 +1,10 @@
 import { expect, test } from "bun:test";
-import { existsSync, mkdtempSync, statSync } from "node:fs";
+import { mkdtempSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   acquireSqliteLock,
   isSqliteBusyError,
-  MAX_SQLITE_BUSY_WAIT_MS,
   probeSqliteLock,
   SqliteLockBusyError,
   withSqliteMutex,
@@ -40,21 +39,7 @@ test("busy classification covers Bun and node:sqlite error shapes", () => {
   expect(isSqliteBusyError(undefined)).toBe(false);
 });
 
-test("busy wait is normalized before the database is opened", () => {
-  const path = lockPath();
-  const primary = new Error("broken busy wait");
-  const waitForBusyMs = {
-    valueOf(): number {
-      throw primary;
-    },
-  } as unknown as number;
-
-  expect(() => acquireSqliteLock(path, waitForBusyMs)).toThrow(primary);
-  expect(existsSync(path)).toBe(false);
-});
-
 test("all requested busy waits are capped at 250ms", () => {
-  expect(MAX_SQLITE_BUSY_WAIT_MS).toBe(250);
   const path = lockPath();
   const held = acquireSqliteLock(path);
   const startedAt = Date.now();

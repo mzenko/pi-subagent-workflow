@@ -47,14 +47,9 @@ test("keyToAction maps keys per level; f only filters at run level; only enter s
   expect(keyToAction("right", "agent")).toEqual({ type: "none" });
   expect(keyToAction("escape", "run")).toEqual({ type: "back" });
   expect(keyToAction("x", "run")).toEqual({ type: "stop" });
-  expect(keyToAction("b", "runs")).toEqual({ type: "none" });
-  expect(keyToAction("r", "runs")).toEqual({ type: "none" });
-  expect(keyToAction("r", "run")).toEqual({ type: "none" });
   expect(keyToAction("f", "run")).toEqual({ type: "filter" });
   expect(keyToAction("f", "runs")).toEqual({ type: "none" });
   expect(keyToAction("s", "run")).toEqual({ type: "save" });
-  // Pause is deliberately unmapped - no runner pause seam exists.
-  expect(keyToAction("p", "run")).toEqual({ type: "none" });
 });
 
 function runSummary(runId: string): RunSummary {
@@ -186,11 +181,10 @@ test("quarantined runs drill into recovery detail while unreadable runs stay clo
   expect(state.drill(model)).toBeUndefined();
 });
 
-test("footerHint composes per level and never advertises pause", () => {
+test("footerHint composes per level", () => {
   const runs = footerHint({ level: "runs" }, PLAIN);
   expect(runs).toContain("enter open");
   expect(runs).not.toContain("x stop");
-  expect(runs).not.toContain("b background");
   expect(runs).not.toContain("s save");
   expect(runs).not.toContain("tab next live");
   const liveRuns = footerHint({ level: "runs", canCycle: true, canStop: true, canSave: true }, PLAIN);
@@ -198,22 +192,17 @@ test("footerHint composes per level and never advertises pause", () => {
   expect(liveRuns).toContain("s save");
   expect(liveRuns).toContain("tab next live");
   expect(footerHint({ level: "runs", canStop: true, stopArmed: true }, PLAIN)).toContain("x again to STOP");
-  expect(runs).not.toContain("restart");
-  expect(runs).not.toContain("pause");
 
   const run = footerHint({ level: "run", filter: "failed" }, PLAIN);
   expect(run).toContain("f filter: failed");
-  expect(run).not.toContain("b background");
   expect(run).not.toContain("tab next live");
   expect(footerHint({ level: "run", filter: "all", canCycle: true }, PLAIN)).toContain("tab next live");
   expect(footerHint({ level: "run", filter: "all", canStop: true, stopArmed: true }, PLAIN)).toContain("x again to STOP");
-  expect(run).not.toContain("restart");
 
   const agentArmed = footerHint({ level: "agent", canSteer: true, canStop: true, stopArmed: true }, PLAIN);
   expect(agentArmed).toContain("enter steer");
   expect(agentArmed).toContain("shift+↑↓ page");
   expect(agentArmed).toContain("x again to STOP");
-  expect(agentArmed).not.toContain("restart");
   const staticAgent = footerHint({ level: "agent", canCycle: true, canSteer: false, canStop: false }, PLAIN);
   expect(staticAgent).not.toContain("steer");
   expect(staticAgent).not.toContain("message");

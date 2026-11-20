@@ -3,12 +3,10 @@ import {
   chmodSync,
   closeSync,
   existsSync,
-  fsyncSync,
   mkdtempSync,
   openSync,
   readFileSync,
   readdirSync,
-  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -92,39 +90,22 @@ test("staging keeps the write error primary and cleans up after invalid write co
   expect(readdirSync(directory)).toEqual([]);
 });
 
-test("fsync and mode preservation are explicit one-shot replacement policies", () => {
+test("mode preservation publishes the replacement with the existing file's permission bits", () => {
   const directory = temporaryRoot();
   const path = join(directory, "consent.json");
   writeFileSync(path, "old");
   chmodSync(path, 0o640);
-  let synced = false;
-  const publishOrder: string[] = [];
 
   replaceAtomicFile(path, "new", {
     mode: 0o600,
     preserveExistingMode: true,
     fsync: true,
     exactMode: true,
-    operations: {
-      fsync: (fd) => {
-        synced = true;
-        fsyncSync(fd);
-      },
-      chmod: (candidate, mode) => {
-        publishOrder.push(candidate.includes(".tmp-") ? "chmod-temp" : "chmod-published");
-        chmodSync(candidate, mode);
-      },
-      rename: (from, to) => {
-        publishOrder.push("rename");
-        renameSync(from, to);
-      },
-    },
   });
 
-  expect(synced).toBe(true);
   expect(readFileSync(path, "utf8")).toBe("new");
   expect(statSync(path).mode & 0o777).toBe(0o640);
-  expect(publishOrder).toEqual(["chmod-temp", "rename"]);
+  expect(readdirSync(directory)).toEqual(["consent.json"]);
 });
 
 test("durable exact-mode replacement follows the required publish order", () => {

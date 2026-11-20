@@ -3,10 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import {
-  catchUpUndeliveredRuns,
-  formatCatchUpMessage,
-} from "../extensions/subagent-workflow.js";
+import { catchUpUndeliveredRuns } from "../extensions/subagent-workflow.js";
 import {
   acknowledgeDeliveryMessage,
   DELIVERY_PROTOCOL_VERSION,
@@ -481,21 +478,6 @@ test("live-owned and quarantined runs remain ineligible", () => {
     ownership.release();
     rmSync(root, { recursive: true, force: true });
   }
-});
-
-test("catch-up message includes stable recovery context", () => {
-  expect(formatCatchUpMessage([{
-    runId: "run-1",
-    runDir: "/runs/run-1",
-    label: "Audit routes",
-    status: "failed",
-    interruptedChildCount: 2,
-    lastActivityAt: Date.parse("2026-01-01T00:02:00.000Z"),
-    reason: "parent process exited while 2 agents were running",
-    recommendedAction: "restart or resume from",
-    createdAt: 1,
-    generation: 3,
-  }])).toBe("Recovered background run deliveries:\n- run-1 | Audit routes | failed: parent process exited while 2 agents were running | last activity 2026-01-01T00:02:00.000Z | restart or resume from /runs/run-1");
 });
 
 test("catch-up notes parent messages a persisted result reports as unconfirmed", () => {

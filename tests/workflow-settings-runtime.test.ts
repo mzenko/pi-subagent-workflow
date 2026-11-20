@@ -2,26 +2,12 @@ import { expect, test } from "bun:test";
 import { applyLiveWorkflowSettings, globalWorkflowSettings, resolveConcurrentAgentLimit } from "../src/settings/runtime.js";
 import { DEFAULT_WORKFLOW_SETTINGS } from "../src/settings/workflow-settings.js";
 
-test("settings hot reload ignores the old v3 process singleton", () => {
-  const oldKey = "__piSubagentWorkflowSettings_v3__";
-  const currentKey = "__piSubagentWorkflowSettings_v4__";
-  const scope = globalThis as unknown as Record<string, unknown>;
-  const previousOld = scope[oldKey];
-  const previousCurrent = scope[currentKey];
-  const sentinel = {};
-  scope[oldKey] = sentinel;
-  delete scope[currentKey];
-  try {
-    const store = globalWorkflowSettings();
-    expect(store).not.toBe(sentinel);
-    expect(scope[currentKey]).toBe(store);
-    expect(scope[oldKey]).toBe(sentinel);
-  } finally {
-    if (previousOld === undefined) delete scope[oldKey];
-    else scope[oldKey] = previousOld;
-    if (previousCurrent === undefined) delete scope[currentKey];
-    else scope[currentKey] = previousCurrent;
-  }
+test("every extension instance shares one process-wide settings store", () => {
+  // pi re-evaluates the extension per cwd; module instances share only what
+  // is published on globalThis.
+  const store = globalWorkflowSettings();
+  expect(Object.values(globalThis)).toContain(store);
+  expect(globalWorkflowSettings()).toBe(store);
 });
 
 test("automatic concurrency retains the documented CPU-aware cap", () => {

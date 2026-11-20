@@ -71,15 +71,12 @@ const RENDERERS: Array<[string, new (terminal: Terminal) => Renderer]> = [
 ];
 
 describe.each(RENDERERS)("%s", (_name, Kind) => {
-  test("control: without the workaround pi still re-places the image while the panel is open", () => {
-    // If this starts failing, pi-tui hides covered images itself and
-    // suppress-inline-images.ts can be deleted.
-    const frames = cycle(Kind, false);
-    expect(places(frames.initial)).toBe(true);
-    expect(places(frames.open)).toBe(true);
-  });
-
   test("with the workaround the image is removed while the panel is open and restored on close", () => {
+    // Baseline: without the workaround pi re-places the image over the open
+    // panel. If this stops holding, pi-tui hides covered images itself and
+    // suppress-inline-images.ts can be deleted.
+    expect(places(cycle(Kind, false).open)).toBe(true);
+
     const frames = cycle(Kind, true);
     expect(places(frames.initial)).toBe(true);
     expect(deletes(frames.open)).toBe(true);

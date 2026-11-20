@@ -61,7 +61,12 @@ test("subagent rows survive a details payload full of wrong types", () => {
     PLAIN,
     undefined,
   );
-  expect(() => component.render(80)).not.toThrow();
+  // render() is guarded, so "does not throw" would hold even if the rows threw:
+  // assert the row is actually drawn rather than the render-failed notice.
+  const lines = component.render(80);
+  expect(lines).toHaveLength(1);
+  expect(lines[0]).toContain("▸");
+  expect(lines.join("\n")).not.toContain("render failed");
 });
 
 test("guardedLines degrades a throwing renderer to a notice", () => {

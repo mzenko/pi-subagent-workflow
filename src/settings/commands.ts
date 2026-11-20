@@ -110,7 +110,7 @@ export function parseNumericSetting(id: NumericSettingId, text: string): number 
   return value;
 }
 
-export function confirmAutoApproval(ctx: ExtensionCommandContext): Promise<boolean> {
+function confirmAutoApproval(ctx: ExtensionCommandContext): Promise<boolean> {
   return ctx.ui.confirm(
     "Auto-approve all workflows?",
     "Trust every workflow script without showing a launch approval dialog?",

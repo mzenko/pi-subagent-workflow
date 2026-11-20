@@ -2,7 +2,7 @@ import { chmodSync } from "node:fs";
 import { createRequire } from "node:module";
 import { performance } from "node:perf_hooks";
 
-export const MAX_SQLITE_BUSY_WAIT_MS = 250;
+const MAX_SQLITE_BUSY_WAIT_MS = 250;
 
 export interface SqliteLockHandle {
   release(): void;

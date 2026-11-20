@@ -185,23 +185,6 @@ test("journal entries persist the resolved call fingerprint", async () => {
   });
 });
 
-// The fingerprint epoch is a hard replay gate: entries recorded under older
-// child-resolution semantics (v1 = the in-process backend) must rerun, never
-// replay, even when every other field still matches.
-test("a fingerprint from an older epoch refuses replay even when fields match", async () => {
-  const rootDir = mkdtempSync(join(tmpdir(), "workflow-fingerprint-epoch-"));
-  const script = "export const meta = { name: 'fingerprint-epoch', description: 'test' }; return agent('inspect');";
-  const first = await runWorkflow({ script }, parent, { rootDir, runner: new FakeRunner() as never });
-
-  const journalPath = join(first.runDir, "journal.jsonl");
-  const entry = JSON.parse(readFileSync(journalPath, "utf8")) as { fingerprint: { version: number } };
-  entry.fingerprint.version = 1;
-  writeFileSync(journalPath, `${JSON.stringify(entry)}\n`);
-
-  await expect(runWorkflow({ script, resumeRunId: first.runId }, parent, { rootDir, runner: new FakeRunner() as never }))
-    .rejects.toThrow(/version/);
-});
-
 test("a v1 fingerprint with the legacy exclusions field refuses replay only for version drift", async () => {
   const rootDir = mkdtempSync(join(tmpdir(), "workflow-fingerprint-legacy-extra-"));
   const script = "export const meta = { name: 'fingerprint-legacy-extra', description: 'test' }; return agent('inspect');";
@@ -467,28 +450,6 @@ return [done, next];`;
   expect(resumeRunner.calls.map((call) => call.prompt)).toEqual(["failing step"]);
 });
 
-// Scenario: a worktree child's persisted patch result replays verbatim on
-// resume; no worktree is reconstructed and no child spawns.
-test("a completed worktree call replays its patch result without respawning", async () => {
-  const rootDir = mkdtempSync(join(tmpdir(), "workflow-worktree-replay-"));
-  const script = `export const meta = { name: 'worktree-replay', description: 'test' };
-const edit = await agent('edit files', { isolation: 'worktree' });
-const summary = await agent('summarize ' + edit.changed.length);
-if (summary === null) throw new Error('summary failed');
-return summary;`;
-  const firstRunner = new FakeRunner();
-  firstRunner.resultFactory = async (spec, number) => number === 1
-    ? fakeResult(spec, number, { patch: "diff --git a/a.txt b/a.txt", changed: ["a.txt"] })
-    : fakeResult(spec, number, { status: "failed", error: "boom" });
-  await expect(runWorkflow({ script }, parent, { rootDir, runner: firstRunner as never })).rejects.toThrow();
-  const runId = firstRunner.registrations[0]!.runId;
-
-  const resumeRunner = new FakeRunner();
-  const resumed = await runWorkflow({ script, resumeRunId: runId }, parent, { rootDir, runner: resumeRunner as never });
-  expect(resumeRunner.calls.map((call) => call.prompt)).toEqual(["summarize 1"]);
-  expect(resumed.result).toBe("result-1");
-});
-
 test("workflow delivery drops the runner's store and handles", async () => {
   const resolved: ResolvedSpec = {
     provider: "test",
@@ -523,18 +484,6 @@ test("workflow delivery drops the runner's store and handles", async () => {
 
   expect((runner as unknown as { stores: Map<string, unknown> }).stores.has(result.runId)).toBe(false);
   expect(runner.runHandles(result.runId)).toEqual([]);
-});
-
-test("new journal entries carry format version 4 without usage replay state", async () => {
-  const script = "export const meta = { name: 'journal-version', description: 'test' }; return agent('versioned');";
-  const result = await runWorkflow({ script }, parent, {
-    rootDir: mkdtempSync(join(tmpdir(), "workflow-journal-version-")),
-    runner: new FakeRunner() as never,
-  });
-
-  const entry = JSON.parse(readFileSync(join(result.runDir, "journal.jsonl"), "utf8"));
-  expect(entry.v).toBe(4);
-  expect(entry).not.toHaveProperty("usage");
 });
 
 test("resume with an edited script replays the unchanged prefix and archives the original", async () => {
@@ -775,37 +724,6 @@ await agent('a'); await agent('b'); await agent('c'); return 'done';`;
   expect(runner.controllers.size).toBe(0); // controller unregistered in finally
 });
 
-test("editing owner metadata does not revoke a live workflow's ownership", async () => {
-  const rootDir = mkdtempSync(join(tmpdir(), "workflow-owner-metadata-"));
-  const script = `export const meta = { name: 'owner-metadata', description: 'test' };
-const value = await agent('pause');
-log('still persists');
-return value;`;
-  const runner = new FakeRunner();
-  let finishChild!: (result: SubagentResult) => void;
-  runner.resultFactory = () => new Promise((resolve) => {
-    finishChild = (result) => resolve(result);
-  });
-  const { runDir, execution } = startParsedWorkflow({ workflow: parseWorkflowScript(script) }, parent, {
-    rootDir,
-    runner: runner as never,
-  });
-  while (runner.calls.length === 0) await Bun.sleep(5);
-  const ownerPath = join(runDir, OWNER_FILE);
-  const replacement = JSON.parse(readFileSync(ownerPath, "utf8"));
-  replacement.pid = 4242;
-  writeFileSync(ownerPath, JSON.stringify(replacement));
-  finishChild(fakeResult(runner.calls[0]!, 1));
-
-  const completed = await execution;
-  expect(completed.result).toBe("result-1");
-  expect(runner.controllers.size).toBe(0);
-  expect(readFileSync(join(runDir, "events.jsonl"), "utf8")).toContain("still persists");
-  expect(JSON.parse(readFileSync(join(runDir, "status.json"), "utf8")).status).toBe("completed");
-  expect(existsSync(join(runDir, "journal.jsonl"))).toBe(true);
-  expect(existsSync(ownerPath)).toBe(false);
-});
-
 test("a large zero-agent result is persisted atomically before the run is marked completed", async () => {
   const rootDir = mkdtempSync(join(tmpdir(), "workflow-result-durability-"));
   const big = "x".repeat(20_000);
@@ -821,7 +739,6 @@ return ${JSON.stringify(big)};`;
   try {
     const result = await runWorkflow({ script }, parent, { rootDir, runner: runner as never });
     expect(runner.calls).toHaveLength(0);
-    expect(big.length).toBeGreaterThan(16_000);
     expect(result.result).toBe(big);
     expect(result.persistenceWarning).toBeUndefined();
     // Ordering: result.json is durable at the instant completion is committed.

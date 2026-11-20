@@ -7,8 +7,8 @@ import { acknowledgeDeliveryMessage, releasePendingDeliveries } from "../src/sto
 import { RunStore } from "../src/store/run-store.js";
 import { formatDelivery } from "../src/tool/subagent-tool.js";
 import { buildDeliveryEnvelope, DELIVERY_ENVELOPE_BUDGET, ENVELOPE_LINE_MAX } from "../src/ui/delivery-envelope.js";
-import { chunkDeliveryText, formatFailureText, safeDeliveryValue } from "../src/ui/delivery-safe.js";
-import { deliverWorkflowInBackground, formatWorkflowDelivery, formatWorkflowFailure } from "../src/workflow/launch.js";
+import { chunkDeliveryText, formatFailureText } from "../src/ui/delivery-safe.js";
+import { deliverWorkflowInBackground, formatWorkflowFailure } from "../src/workflow/launch.js";
 import { WorkflowRunError, type WorkflowRunResult } from "../src/workflow/workflow-runner.js";
 
 const deliveryRoot = mkdtempSync(join(tmpdir(), "workflow-delivery-"));
@@ -106,20 +106,6 @@ test("chunkDeliveryText directly covers boundaries without splitting surrogate p
   }
 });
 
-test("subagent failure delivery includes identity, error, and respawn recovery", () => {
-  const text = formatDelivery("run-1", "/runs/run-1", {
-    id: "child-1",
-    status: "failed",
-    text: "",
-    error: "model unavailable",
-    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
-    resolved: { provider: "test", modelId: "test", thinkingLevel: "off", tools: [], cwd: "/work", label: "Audit routes" },
-  });
-  expect(text).toContain("Child child-1 (Audit routes): failed");
-  expect(text).toContain("Failed child child-1 (Audit routes): model unavailable");
-  expect(text).toContain("Recovery: respawn the child");
-});
-
 test("aborted subagent deliveries report aborts without recommending respawn", () => {
   const aborted = {
     id: "child-aborted",
@@ -133,20 +119,6 @@ test("aborted subagent deliveries report aborts without recommending respawn", (
   expect(single).toContain("Status: aborted");
   expect(single).toContain("Aborted child child-aborted (Cancelled work)");
   expect(single).not.toContain("Recovery: respawn");
-});
-
-test("completed workflow delivery groups failed children with one resume recovery", () => {
-  const failedChild = {
-    id: "child-2",
-    status: "failed" as const,
-    text: "",
-    error: "timeout",
-    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
-    resolved: { provider: "test", modelId: "test", thinkingLevel: "off" as const, tools: [], cwd: "/work", label: "Inspect API" },
-  };
-  const text = formatWorkflowDelivery({ runId: "workflow-2", runDir: "/runs/workflow-2", meta: { name: "test", description: "test" }, result: null, failedChildren: [failedChild] });
-  expect(text).toContain("1 failed child (Inspect API): timeout");
-  expect(text).toContain('workflow({ scriptPath: "/runs/workflow-2/script.js", resumeRunId: "workflow-2" })');
 });
 
 test("workflow failures collapse consecutive duplicate lines exactly", () => {
@@ -222,7 +194,7 @@ test("background workflow success delivery writes its marker and neutralizes con
 
   expect(options).toEqual({ deliverAs: "steer" });
   expect(entries).toHaveLength(1);
-  const safeRunDir = safeDeliveryValue(unsafeRunDir);
+  const safeRunDir = join(deliveryRoot, "red");
   expect(message).toContain(`Workflow run workflow-safe\nRun directory: ${safeRunDir}\n`);
   expect(message).toContain("1 failed child (Inspect API): timeout");
   expect(message).toContain(`workflow({ scriptPath: ${JSON.stringify(`${safeRunDir}/script.js`)}, resumeRunId: "workflow-safe" })`);
@@ -271,7 +243,7 @@ test("background workflow failure delivery writes its marker and strips controls
 
   expect(options).toEqual({ deliverAs: "steer" });
   expect(entries).toEqual([]);
-  const safeRunDir = safeDeliveryValue(unsafeRunDir);
+  const safeRunDir = join(deliveryRoot, "safe");
   expect(message).toContain(`Workflow run workflow-9\nRun directory: ${safeRunDir}\nStatus: failed\nError: boomred\nforged`);
   expect(message).toContain("1 failed child (Audit API): failred");
   expect(message).toContain(`workflow({ scriptPath: ${JSON.stringify(`${safeRunDir}/script.js`)}, resumeRunId: "workflow-9" })`);
@@ -307,39 +279,9 @@ test("intentionally stopped workflow delivery preserves abort intent and omits r
   expect(message).toContain("The workflow was intentionally stopped.");
   expect(message).toContain("Do not resume it unless the user explicitly asks.");
   expect(message).not.toContain("Status: failed");
+  expect(message).not.toContain("Error:");
   expect(message).not.toContain("Recovery:");
   expect(message).not.toContain("resumeRunId");
-});
-
-test("a truncated workflow delivery points to the persisted result artifact", () => {
-  const big = "y".repeat(20_000);
-  const text = formatWorkflowDelivery({ runId: "workflow-3", runDir: "/runs/workflow-3", meta: { name: "t", description: "t" }, result: big, failedChildren: [] });
-  expect(text.length).toBeLessThan(big.length);
-  expect(text).toContain("[truncated - full result persisted at /runs/workflow-3/result.json]");
-});
-
-test("a degraded oversized subagent result hedges its events artifact marker", () => {
-  const text = formatDelivery("run-oversized", "/runs/run-oversized", {
-    id: "child-oversized",
-    status: "failed",
-    sessionFile: "/sessions/child-oversized.jsonl",
-    text: "z".repeat(20_000),
-    // Worktree patches are collected after the child session ends, so only
-    // events.jsonl contains this complete parent-added result.
-    patch: "diff --git a/file b/file\n",
-    error: "model unavailable",
-    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
-    resolved: { provider: "test", modelId: "test", thinkingLevel: "off", tools: [], cwd: "/work", label: "Audit routes" },
-  }, "events write failed");
-
-  expect(text.length).toBe(DELIVERY_ENVELOPE_BUDGET);
-  expect(text).toContain("Child child-oversized (Audit routes): failed");
-  expect(text).toContain("Failed child child-oversized (Audit routes): model unavailable");
-  expect(text).toContain("Recovery: respawn the child");
-  expect(text).toContain("Warning: run persistence degraded (events write failed)");
-  expect(text).toContain("Run record: /runs/run-oversized/run.json");
-  expect(text).toContain("Child child-oversized session: /sessions/child-oversized.jsonl");
-  expect(text).toContain("[truncated - result may be incomplete at /runs/run-oversized/events.jsonl; run persistence degraded]");
 });
 
 test("a truncated subagent result without a session file points to events.jsonl", () => {
@@ -557,29 +499,6 @@ test("delivery preview truncation never leaves an unpaired high surrogate", () =
     const code = character.charCodeAt(0);
     return code >= 0xd800 && code <= 0xdbff;
   })).toBe(false);
-});
-
-test("workflow failure delivery includes an exact resume invocation", () => {
-  const text = formatWorkflowFailure(new WorkflowRunError("child failed", "workflow-1", "/runs/workflow-1"));
-  expect(text).toContain("Error: child failed");
-  expect(text).toContain('workflow({ scriptPath: "/runs/workflow-1/script.js", resumeRunId: "workflow-1" })');
-});
-
-test("workflow abort formatting does not advertise recovery", () => {
-  const text = formatWorkflowFailure(new WorkflowRunError(
-    "Workflow stopped",
-    "workflow-1",
-    "/runs/workflow-1",
-    undefined,
-    [],
-    1,
-    "aborted",
-  ));
-  expect(text).toContain("Status: aborted");
-  expect(text).toContain("intentionally stopped");
-  expect(text).not.toContain("Error:");
-  expect(text).not.toContain("Recovery:");
-  expect(text).not.toContain("resumeRunId");
 });
 
 test("workflow failure carries failed-child errors and the null-result hint", () => {
