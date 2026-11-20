@@ -322,7 +322,7 @@ export function registerSubagentTool(pi: ExtensionAPI, selfPath: string, widget?
         const resolved = resolveModel(spec, ctx, parent.thinkingLevel);
         display = { modelId: resolved.model.id, thinking: resolved.thinking };
       } catch { /* the child will fail (or not) on its own terms */ }
-      const handle = runner.spawnRun(spawnSpec, parent, { acceptsParentMessages: true });
+      const handle = runner.spawnRun(spawnSpec, parent, { parentAddressable: true });
       const { runId, runDir } = handle;
       appendEntrySafely(pi, "subagent-workflow:run-started", {
         runId,

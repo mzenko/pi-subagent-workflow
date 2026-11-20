@@ -53,6 +53,11 @@ function isRunActivity(event: ChildSessionEvent): boolean {
     || event.type === "tool_execution_end";
 }
 
+function removeOne(list: string[], text: string): void {
+  const index = list.indexOf(text);
+  if (index !== -1) list.splice(index, 1);
+}
+
 /** Narrow the untyped JSONL transport to the events this repository consumes. */
 function childSessionEvent(event: Record<string, unknown>): ChildSessionEvent | undefined {
   if (typeof event.type !== "string") return undefined;
@@ -304,13 +309,11 @@ export class RpcChildSession implements ChildSession {
     // Track before sending so an arrival that beats the ack still matches.
     // pi expands a leading "/" (skills, prompt templates), so that text never
     // arrives verbatim and could not be matched off this list.
-    const tracked = !text.startsWith("/");
-    if (tracked) this.unreadSteers.push(text);
+    if (!text.startsWith("/")) this.unreadSteers.push(text);
     try {
       await this.rpc.request({ type: "steer", message: text }, { timeoutMs: CONTROL_REQUEST_TIMEOUT_MS });
     } catch (error) {
-      const index = tracked ? this.unreadSteers.lastIndexOf(text) : -1;
-      if (index !== -1) this.unreadSteers.splice(index, 1);
+      removeOne(this.unreadSteers, text);
       throw error;
     }
   }
@@ -400,8 +403,7 @@ export class RpcChildSession implements ChildSession {
 
   private handleEvent(event: ChildSessionEvent): void {
     if (event.type === "message_start" && event.message.role === "user") {
-      const index = this.unreadSteers.indexOf(userMessageText(event.message.content));
-      if (index !== -1) this.unreadSteers.splice(index, 1);
+      removeOne(this.unreadSteers, userMessageText(event.message.content));
     }
     const activeTurn = this.turn;
     const assistantUpdate = knownAssistantMessageUpdate(event);

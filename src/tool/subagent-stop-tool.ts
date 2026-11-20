@@ -3,6 +3,7 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { subagentRunner, type SubagentRunner } from "../runner/runner.js";
 import { assertSchemaValue } from "../subagent-spec.js";
+import type { ParentStopReceipt } from "../types.js";
 import { linesComponent } from "../ui/component.js";
 import { sanitizeTerminalTextChunks, UNTRUSTED_FIELD_MAX } from "../ui/sanitize.js";
 import { renderCallHeader } from "../ui/tool-render.js";
@@ -14,6 +15,11 @@ export const SubagentStopToolParameters = Type.Object({
 export type SubagentStopToolInput = Static<typeof SubagentStopToolParameters>;
 
 const DESCRIPTION = "Stop a running subagent or workflow that this session started - for example when the user asks to cancel it, or its work is no longer needed. Pass a subagent's id or runId, or a workflow's runId. A workflow stops as a whole: its loop is cancelled and every live child is aborted. The call returns once the run has stopped. Its aborted result is still delivered later as a message, with any partial output; do not respawn or resume it unless the user asks. If the subagent had already finished its work, the call reports status already-finished and its normal result arrives as usual; if it ignored the stop and had to be killed, it reports terminated.";
+
+const NOTES: Partial<Record<ParentStopReceipt["status"], string>> = {
+  "already-finished": "It had already finished its work before the stop arrived; its result is delivered as usual.",
+  terminated: "It ignored the stop and was killed. Its failed result still arrives with a respawn hint; do not respawn it unless the user asks.",
+};
 
 /**
  * Parent-model counterpart of the /agents stop. The runner enforces that only
@@ -28,13 +34,10 @@ export function registerSubagentStopTool(pi: ExtensionAPI, runner: SubagentRunne
     async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult<undefined>> {
       try {
         assertSchemaValue(SubagentStopToolParameters, params, "subagent_stop input");
-        const stopped = await runner.stopForParent(params.id.trim(), ctx.sessionManager.getSessionId());
+        const receipt = await runner.stopForParent(params.id.trim(), ctx.sessionManager.getSessionId());
+        const note = NOTES[receipt.status];
         return {
-          content: [{ type: "text", text: JSON.stringify(stopped.status === "already-finished"
-            ? { ...stopped, note: "It had already finished its work before the stop arrived; its result is delivered as usual." }
-            : stopped.status === "terminated"
-              ? { ...stopped, note: "It ignored the stop and was killed. Its failed result still arrives with a respawn hint; do not respawn it unless the user asks." }
-              : stopped) }],
+          content: [{ type: "text", text: JSON.stringify(note ? { ...receipt, note } : receipt) }],
           details: undefined,
         };
       } catch (error) {

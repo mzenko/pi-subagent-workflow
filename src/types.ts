@@ -111,6 +111,15 @@ export interface UnconfirmedParentMessage {
   preview: string;
 }
 
+/** What subagent_stop did. "terminated": it ignored the stop and was killed after the settle grace. */
+export interface ParentStopReceipt {
+  runId: string;
+  kind: "workflow" | "subagent";
+  status: "stopped" | "already-finished" | "terminated";
+  /** The child's failure, when its result failed after the stop. */
+  error?: string;
+}
+
 /** Receipt for a parent message accepted for a live child. */
 export interface ParentMessageReceipt {
   childId: string;

@@ -106,50 +106,48 @@ export function blankViewportImageLines(lines: readonly string[], termHeight: nu
 }
 
 /**
- * After compositing: blank a Kitty anchor above the viewport whose reserved
- * rows reach the overlay's top row. `input` is the frame handed to the
- * compositor, `composited` what it returned (padded to at least termHeight).
- * Lines above the viewport are never touched by compositing, so replacing one
- * here is equivalent to having blanked it beforehand.
+ * After compositing: blank a Kitty anchor above the viewport whose rows reach
+ * down under the panel. `input` is the frame handed to the compositor,
+ * `composited` what it returned (padded to at least termHeight). Compositing
+ * never touches lines above the viewport, so blanking one here is the same as
+ * having blanked it beforehand.
  */
 export function blankImageAnchorsAbovePanel(input: readonly string[], composited: string[], termHeight: number): string[] {
   const viewportStart = Math.max(0, composited.length - termHeight);
   if (viewportStart === 0) return composited;
-  let panelTop = -1;
-  for (let index = viewportStart; index < composited.length; index += 1) {
-    if (composited[index] !== (input[index] ?? "")) {
-      panelTop = index;
-      break;
-    }
+  // The panel's top row is the first viewport row the compositor changed.
+  const panelTop = composited.findIndex((line, index) => index >= viewportStart && line !== (input[index] ?? ""));
+  const anchor = kittyAnchorAbove(composited, viewportStart);
+  if (panelTop === -1 || anchor === -1 || imageBlockEnd(input, anchor) < panelTop) return composited;
+  const result = [...composited];
+  result[anchor] = "";
+  return result;
+}
+
+/**
+ * The Kitty anchor just above the viewport whose blank reserved rows run down
+ * to it, or -1. Visible text or an iTerm2 image in between ends the search.
+ */
+function kittyAnchorAbove(lines: readonly string[], viewportStart: number): number {
+  for (let index = viewportStart - 1; index >= Math.max(0, viewportStart - MAX_IMAGE_ROWS); index -= 1) {
+    const line = lines[index]!;
+    if (line.includes(KITTY)) return index;
+    if (line.includes(ITERM2) || visibleWidth(line) > 0) return -1;
   }
-  if (panelTop === -1) return composited;
-  // Walk up through the blank rows a Kitty image reserves below its anchor. Any
-  // visible text ends the block, exactly as pi-tui measures reserved rows.
-  const stop = Math.max(0, viewportStart - MAX_IMAGE_ROWS);
-  for (let index = viewportStart - 1; index >= stop; index -= 1) {
-    const line = composited[index]!;
-    if (line.includes(KITTY)) {
-      // The block ends at its declared rows or at the first visible text in
-      // the uncomposited frame, whichever comes first.
-      const declared = kittyRows(line);
-      let blockEnd = index + (declared ?? MAX_IMAGE_ROWS) - 1;
-      for (let row = index + 1; row <= blockEnd && row < input.length; row += 1) {
-        const below = input[row] ?? "";
-        if (isImageLine(below) || visibleWidth(below) > 0) {
-          blockEnd = row - 1;
-          break;
-        }
-      }
-      if (blockEnd >= panelTop) {
-        const result = [...composited];
-        result[index] = "";
-        return result;
-      }
-      return composited;
-    }
-    if (line.includes(ITERM2) || visibleWidth(line) > 0) return composited;
+  return -1;
+}
+
+/**
+ * Last row an image block covers, measured as pi-tui measures reserved rows:
+ * its declared rows, cut short by the first visible text or image below it.
+ */
+function imageBlockEnd(lines: readonly string[], anchor: number): number {
+  const last = anchor + (kittyRows(lines[anchor]!) ?? MAX_IMAGE_ROWS) - 1;
+  for (let row = anchor + 1; row <= last; row += 1) {
+    const line = lines[row] ?? "";
+    if (isImageLine(line) || visibleWidth(line) > 0) return row - 1;
   }
-  return composited;
+  return last;
 }
 
 interface PatchEntry {

@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -65,7 +66,7 @@ function runnerFor(session: ChildSession, semaphore = new Semaphore(1)): Subagen
 test("a parent message is wrapped, queued, and confirmed when it enters the child conversation", async () => {
   const child = controllableSession();
   const runner = runnerFor(child.session);
-  const handle = runner.spawnRun({ prompt: "work" }, parent(), { acceptsParentMessages: true });
+  const handle = runner.spawnRun({ prompt: "work" }, parent(), { parentAddressable: true });
   await child.started;
 
   const receipt = await runner.messageChild(handle.id, "parent", "also check the tests");
@@ -82,7 +83,7 @@ test("a parent message is wrapped, queued, and confirmed when it enters the chil
 test("a message the child never reads is reported as unconfirmed in its result", async () => {
   const child = controllableSession();
   const runner = runnerFor(child.session);
-  const handle = runner.spawnRun({ prompt: "work" }, parent(), { acceptsParentMessages: true });
+  const handle = runner.spawnRun({ prompt: "work" }, parent(), { parentAddressable: true });
   await child.started;
 
   await runner.messageChild(handle.id, "parent", "first");
@@ -100,7 +101,7 @@ test("a message the child never reads is reported as unconfirmed in its result",
 test("identical message text is confirmed once per arrival, never by the original prompt", async () => {
   const child = controllableSession();
   const runner = runnerFor(child.session);
-  const handle = runner.spawnRun({ prompt: "same" }, parent(), { acceptsParentMessages: true });
+  const handle = runner.spawnRun({ prompt: "same" }, parent(), { parentAddressable: true });
   await child.started;
 
   await runner.messageChild(handle.id, "parent", "same");
@@ -118,7 +119,7 @@ test("a message to a queued child is buffered and reaches it after construction"
   const release = await semaphore.acquire(new AbortController().signal);
   const child = controllableSession();
   const runner = runnerFor(child.session, semaphore);
-  const handle = runner.spawnRun({ prompt: "work" }, parent(), { acceptsParentMessages: true });
+  const handle = runner.spawnRun({ prompt: "work" }, parent(), { parentAddressable: true });
 
   const receipt = await runner.messageChild(handle.id, "parent", "context for later");
   expect(receipt.delivery).toBe("buffered");
@@ -137,7 +138,7 @@ test("a buffered message is reported when the queued child is aborted before it 
   const release = await semaphore.acquire(new AbortController().signal);
   const child = controllableSession();
   const runner = runnerFor(child.session, semaphore);
-  const handle = runner.spawnRun({ prompt: "work" }, parent(), { acceptsParentMessages: true });
+  const handle = runner.spawnRun({ prompt: "work" }, parent(), { parentAddressable: true });
 
   await runner.messageChild(handle.id, "parent", "never read");
   await handle.abort();
@@ -161,7 +162,7 @@ test("a message sent while buffered messages are being handed over queues behind
     },
   });
   const runner = runnerFor(child.session, semaphore);
-  const handle = runner.spawnRun({ prompt: "work" }, parent(), { acceptsParentMessages: true });
+  const handle = runner.spawnRun({ prompt: "work" }, parent(), { parentAddressable: true });
   await runner.messageChild(handle.id, "parent", "one");
   await runner.messageChild(handle.id, "parent", "two");
 
@@ -203,7 +204,7 @@ test("a stopped child that restarts on an unread message is aborted again and se
   } as unknown as ChildSession;
   // The settle grace never elapses, so only the re-abort can end this test.
   const runner = new SubagentRunner(async () => ({ session, resolved }), new Semaphore(1), temporaryStore, () => new Promise(() => {}));
-  const handle = runner.spawnRun({ prompt: "work" }, parent(), { acceptsParentMessages: true });
+  const handle = runner.spawnRun({ prompt: "work" }, parent(), { parentAddressable: true });
   await started.promise;
   await runner.messageChild(handle.id, "parent", "unread");
 
@@ -228,7 +229,7 @@ test("stopping a child mid-flush sends no more of the buffered backlog", async (
     },
   });
   const runner = runnerFor(child.session, semaphore);
-  const handle = runner.spawnRun({ prompt: "work" }, parent(), { acceptsParentMessages: true });
+  const handle = runner.spawnRun({ prompt: "work" }, parent(), { parentAddressable: true });
   for (const text of ["one", "two", "three"]) await runner.messageChild(handle.id, "parent", text);
 
   release();
@@ -248,7 +249,7 @@ test("a failed buffered flush leaves the message unconfirmed without failing the
   const release = await semaphore.acquire(new AbortController().signal);
   const child = controllableSession({ steer: async () => { throw new Error("rpc timeout"); } });
   const runner = runnerFor(child.session, semaphore);
-  const handle = runner.spawnRun({ prompt: "work" }, parent(), { acceptsParentMessages: true });
+  const handle = runner.spawnRun({ prompt: "work" }, parent(), { parentAddressable: true });
 
   await runner.messageChild(handle.id, "parent", "lost in transit");
   release();
@@ -263,7 +264,7 @@ test("a failed buffered flush leaves the message unconfirmed without failing the
 test("a rejected send is an error and is not tracked", async () => {
   const child = controllableSession({ steer: async () => { throw new Error("child exited"); } });
   const runner = runnerFor(child.session);
-  const handle = runner.spawnRun({ prompt: "work" }, parent(), { acceptsParentMessages: true });
+  const handle = runner.spawnRun({ prompt: "work" }, parent(), { parentAddressable: true });
   await child.started;
 
   await expect(runner.messageChild(handle.id, "parent", "hello")).rejects.toThrow("child exited");
@@ -276,7 +277,7 @@ test("messages are refused once the child is finishing, before its result exists
   const disposing = gate();
   const child = controllableSession({ dispose: async () => { disposing.open(); await disposal.promise; } });
   const runner = runnerFor(child.session);
-  const handle = runner.spawnRun({ prompt: "work" }, parent(), { acceptsParentMessages: true });
+  const handle = runner.spawnRun({ prompt: "work" }, parent(), { parentAddressable: true });
   await child.started;
   child.finishTurn();
   await disposing.promise;
@@ -289,26 +290,26 @@ test("messages are refused once the child is finishing, before its result exists
   await expect(handle.steer("after the end")).rejects.toThrow("has finished");
 });
 
-test("a finished child gets an error with continuation advice, not a silent buffer", async () => {
+test("a finished child gets an error, not a silent buffer", async () => {
   const child = controllableSession();
   const runner = runnerFor(child.session);
-  const handle = runner.spawnRun({ prompt: "work" }, parent(), { acceptsParentMessages: true });
+  const handle = runner.spawnRun({ prompt: "work" }, parent(), { parentAddressable: true });
   await child.started;
   child.finishTurn();
   await handle.result;
 
   // Still registered until delivery retires it.
-  await expect(runner.messageChild(handle.id, "parent", "late")).rejects.toThrow(/has finished.*followUp/);
+  await expect(runner.messageChild(handle.id, "parent", "late")).rejects.toThrow("has finished");
 });
 
 test("only this session's subagent-tool children are addressable", async () => {
   const child = controllableSession();
   const runner = runnerFor(child.session);
-  const own = runner.spawnRun({ prompt: "work" }, parent(), { acceptsParentMessages: true });
+  const own = runner.spawnRun({ prompt: "work" }, parent(), { parentAddressable: true });
   await child.started;
 
-  await expect(runner.messageChild(own.id, "other-session", "hi")).rejects.toThrow("No live subagent");
-  await expect(runner.messageChild("subagent-missing", "parent", "hi")).rejects.toThrow("No live subagent");
+  await expect(runner.messageChild(own.id, "other-session", "hi")).rejects.toThrow("No subagent");
+  await expect(runner.messageChild("subagent-missing", "parent", "hi")).rejects.toThrow("No subagent");
   // The run id resolves to its single child.
   expect((await runner.messageChild(own.runId, "parent", "by run id")).childId).toBe(own.id);
   child.finishTurn();
@@ -318,7 +319,7 @@ test("only this session's subagent-tool children are addressable", async () => {
   const workflowRunner = runnerFor(workflowChild.session);
   const internal = workflowRunner.spawnRun({ prompt: "work" }, parent());
   await workflowChild.started;
-  await expect(workflowRunner.messageChild(internal.id, "parent", "hi")).rejects.toThrow("was not started by the subagent tool");
+  await expect(workflowRunner.messageChild(internal.id, "parent", "hi")).rejects.toThrow("cannot be addressed by id");
   workflowChild.finishTurn();
   await internal.result;
 });
@@ -359,18 +360,18 @@ test("subagent_message rejects blank input, forwards text as written, scopes the
 test("subagent_stop stops this session's subagent by child id or run id and refuses others", async () => {
   const first = controllableSession();
   const runner = runnerFor(first.session);
-  const own = runner.spawnRun({ prompt: "work" }, parent(), { acceptsParentMessages: true });
+  const own = runner.spawnRun({ prompt: "work" }, parent(), { parentAddressable: true });
   await first.started;
 
-  await expect(runner.stopForParent(own.id, "other-session")).rejects.toThrow("No running subagent or workflow");
+  await expect(runner.stopForParent(own.id, "other-session")).rejects.toThrow("No subagent");
   expect(await runner.stopForParent(own.id, "parent")).toEqual({ runId: own.runId, kind: "subagent", status: "stopped" });
   expect((await own.result).status).toBe("aborted");
-  // Settled: a second stop finds nothing live.
-  await expect(runner.stopForParent(own.runId, "parent")).rejects.toThrow("may already have finished");
+  // Settled: a second stop changes nothing.
+  expect(await runner.stopForParent(own.runId, "parent")).toEqual({ runId: own.runId, kind: "subagent", status: "already-finished" });
 
   const second = controllableSession();
   const byRun = runnerFor(second.session);
-  const handle = byRun.spawnRun({ prompt: "work" }, parent(), { acceptsParentMessages: true });
+  const handle = byRun.spawnRun({ prompt: "work" }, parent(), { parentAddressable: true });
   await second.started;
   expect(await byRun.stopForParent(handle.runId, "parent")).toEqual({ runId: handle.runId, kind: "subagent", status: "stopped" });
   expect((await handle.result).status).toBe("aborted");
@@ -381,7 +382,7 @@ test("subagent_stop does not claim to stop a child whose prompt already returned
   const disposing = gate();
   const child = controllableSession({ dispose: async () => { disposing.open(); await disposal.promise; } });
   const runner = runnerFor(child.session);
-  const handle = runner.spawnRun({ prompt: "work" }, parent(), { acceptsParentMessages: true });
+  const handle = runner.spawnRun({ prompt: "work" }, parent(), { parentAddressable: true });
   await child.started;
   child.finishTurn();
   await disposing.promise;
@@ -397,7 +398,7 @@ test("subagent_stop stops a child still queued for admission", async () => {
   const release = await semaphore.acquire(new AbortController().signal);
   const child = controllableSession();
   const runner = runnerFor(child.session, semaphore);
-  const handle = runner.spawnRun({ prompt: "work" }, parent(), { acceptsParentMessages: true });
+  const handle = runner.spawnRun({ prompt: "work" }, parent(), { parentAddressable: true });
   expect(handle.status).toBe("pending");
 
   expect(await runner.stopForParent(handle.id, "parent")).toEqual({ runId: handle.runId, kind: "subagent", status: "stopped" });
@@ -419,7 +420,7 @@ test("subagent_stop reports a child that ignored the stop and was terminated", a
   } as unknown as ChildSession;
   // The settle grace elapses at once, so the stuck child is abandoned.
   const runner = new SubagentRunner(async () => ({ session, resolved }), new Semaphore(1), temporaryStore, async () => {});
-  const handle = runner.spawnRun({ prompt: "work" }, parent(), { acceptsParentMessages: true });
+  const handle = runner.spawnRun({ prompt: "work" }, parent(), { parentAddressable: true });
   await started.promise;
 
   const stopped = await runner.stopForParent(handle.id, "parent");
@@ -428,16 +429,49 @@ test("subagent_stop reports a child that ignored the stop and was terminated", a
   expect((await handle.result).status).toBe("failed");
 });
 
-test("subagent_stop refuses an individual workflow child and points at the run id", async () => {
+test("a worktree child that stops cooperatively but fails collection is reported stopped, not terminated", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "subagent-stop-worktree-"));
+  execFileSync("git", ["init", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "Test"]);
+  writeFileSync(join(repo, "f.txt"), "x\n");
+  execFileSync("git", ["-C", repo, "add", "-A"]);
+  execFileSync("git", ["-C", repo, "commit", "-m", "init"]);
+  const turn = gate();
+  const started = gate();
+  let worktreeCwd = "";
+  const session = {
+    sessionFile: "/child.jsonl",
+    latestAssistant: undefined,
+    usage: zeroUsage(),
+    subscribe: () => () => {},
+    prompt: async () => { started.open(); await turn.promise; },
+    steer: async () => {},
+    // Honors the stop at once, but leaves a worktree git can no longer read,
+    // so the patch collection that follows fails.
+    abort: async () => { rmSync(join(worktreeCwd, ".git"), { force: true }); turn.open(); },
+    dispose: async () => {},
+  } as unknown as ChildSession;
+  const runner = new SubagentRunner(async (spec) => {
+    worktreeCwd = spec.cwd!;
+    return { session, resolved: { ...resolved, cwd: spec.cwd! } };
+  }, new Semaphore(1), temporaryStore);
+  const handle = runner.spawnRun({ prompt: "work", cwd: repo, isolation: "worktree" }, parent(), { parentAddressable: true });
+  await started.promise;
+
+  const stopped = await runner.stopForParent(handle.id, "parent");
+  expect(stopped).toMatchObject({ runId: handle.runId, kind: "subagent", status: "stopped" });
+  expect(stopped.error).toContain("Failed to collect isolated worktree changes");
+  expect((await handle.result).status).toBe("failed");
+});
+
+test("subagent_stop refuses a workflow child or /agents follow-up by id", async () => {
   const child = controllableSession();
   const runner = runnerFor(child.session);
   const internal = runner.spawnRun({ prompt: "work" }, parent());
   await child.started;
 
-  // Without a workflow controller this is a private /agents follow-up.
-  await expect(runner.stopForParent(internal.id, "parent")).rejects.toThrow("can stop it from /agents");
-  runner.registerRunController(internal.runId, new AbortController(), "other-session", Promise.resolve());
-  await expect(runner.stopForParent(internal.id, "parent")).rejects.toThrow(`pass its runId (${internal.runId})`);
+  await expect(runner.stopForParent(internal.id, "parent")).rejects.toThrow("stop a workflow by its runId");
   child.finishTurn();
   expect((await internal.result).status).toBe("completed");
 });
@@ -451,7 +485,7 @@ test("subagent_stop cancels this session's workflow loop and waits for it to set
   });
   runner.registerRunController("flow-1", controller, "parent", execution);
 
-  await expect(runner.stopForParent("flow-1", "other-session")).rejects.toThrow("No running subagent or workflow");
+  await expect(runner.stopForParent("flow-1", "other-session")).rejects.toThrow("No subagent");
   expect(controller.signal.aborted).toBe(false);
   expect(await runner.stopForParent("flow-1", "parent")).toEqual({ runId: "flow-1", kind: "workflow", status: "stopped" });
   expect(controller.signal.aborted).toBe(true);
