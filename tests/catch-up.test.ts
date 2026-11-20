@@ -498,6 +498,25 @@ test("catch-up message includes stable recovery context", () => {
   }])).toBe("Recovered background run deliveries:\n- run-1 | Audit routes | failed: parent process exited while 2 agents were running | last activity 2026-01-01T00:02:00.000Z | restart or resume from /runs/run-1");
 });
 
+test("catch-up notes parent messages a persisted result reports as unconfirmed", () => {
+  const root = mkdtempSync(join(tmpdir(), "catch-up-unconfirmed-"));
+  const runsRoot = join(root, "runs");
+  const runDir = runFixture(runsRoot, CWD, "run-unconfirmed", { sessionId: SESSION_ID, status: "running" });
+  const event = terminalResultEvent("completed");
+  (event.result as Record<string, unknown>).unconfirmedMessages = [
+    { messageId: "m1", preview: "a" },
+    { messageId: "m2", preview: "b" },
+  ];
+  writeFileSync(join(runDir, "events.jsonl"), `${JSON.stringify(event)}\n`);
+  const pi = { sendUserMessage: () => {} } as unknown as ExtensionAPI;
+  try {
+    const runs = catchUpUndeliveredRuns(pi, context(), runsRoot);
+    expect(runs[0]?.reason).toBe("run finished before its result was delivered; 2 parent messages not confirmed delivered");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 function terminalResultEvent(status: "completed" | "failed"): Record<string, unknown> {
   return {
     timestamp: "2026-01-01T00:03:00.000Z",

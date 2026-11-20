@@ -60,9 +60,14 @@ export function assertSchemaValue(schema: TSchema, value: unknown, label: string
   for (const error of Value.Errors(schema, value)) {
     const details = error as typeof error & {
       keyword?: string;
+      schemaPath?: string;
       instancePath?: string;
       params?: { additionalProperties?: string[]; allowedValue?: unknown };
     };
+    // TypeBox >= 1.4 reports an unknown property twice: first as the bare
+    // `false` subschema it hit ("schema is false"), then as the parent's
+    // additionalProperties error. Report the second, which names the field.
+    if (details.keyword === "boolean" && details.schemaPath?.endsWith("/additionalProperties")) continue;
     const unknownField = details.params?.additionalProperties?.[0];
     const escapedUnknownField = unknownField?.replaceAll("~", "~0").replaceAll("/", "~1");
     const path = escapedUnknownField === undefined

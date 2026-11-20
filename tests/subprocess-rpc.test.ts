@@ -35,7 +35,7 @@ describe("buildChildArgs", () => {
       "--thinking", "high",
       "--session-dir", "/runs/r1/sessions",
       "--append-system-prompt", "You are a subagent.",
-      "--exclude-tools", "subagent,workflow",
+      "--exclude-tools", "subagent,workflow,subagent_message,subagent_stop",
       "--tools", "read,bash",
       "--extension", "/pkg/dist/child-shim.js",
     ]);
@@ -44,7 +44,7 @@ describe("buildChildArgs", () => {
   test("always excludes the recursion-guard tools, merged with requested exclusions", () => {
     const args = buildChildArgs({ ...base, excludeTools: ["todo", "subagent"] });
     const excludeIndex = args.indexOf("--exclude-tools");
-    expect(args[excludeIndex + 1]).toBe("todo,subagent,workflow");
+    expect(args[excludeIndex + 1]).toBe("todo,subagent,workflow,subagent_message,subagent_stop");
     expect(args).not.toContain("--tools");
   });
 
@@ -337,6 +337,27 @@ describe("RpcChildSession", () => {
     await expect(session.prompt("stuck")).rejects.toThrow(/neither started an agent run nor settled/);
   }, 20_000);
 
+  test("our own unread steer does not keep an immediately handled prompt from completing", async () => {
+    const rpc = fakeRpc();
+    rpc.respond("steer", undefined);
+    rpc.respond("prompt", undefined);
+    rpc.respond("get_state", { isStreaming: false, isCompacting: false, pendingMessageCount: 1 });
+    const session = new RpcChildSession(rpc, { sessionFile: undefined });
+    await session.steer("[Message m1 from your parent agent]\nnote");
+    await session.prompt("/probe");
+  }, 20_000);
+
+  test("a steer that entered the conversation no longer discounts pending work", async () => {
+    const rpc = fakeRpc();
+    rpc.respond("steer", undefined);
+    rpc.respond("prompt", undefined);
+    rpc.respond("get_state", { isStreaming: false, isCompacting: false, pendingMessageCount: 1 });
+    const session = new RpcChildSession(rpc, { sessionFile: undefined });
+    await session.steer("seen");
+    rpc.emit({ type: "message_start", message: { role: "user", content: [{ type: "text", text: "seen" }] } });
+    await expect(session.prompt("stuck")).rejects.toThrow(/neither started an agent run nor settled/);
+  }, 20_000);
+
   test("transient compaction does not stand down or exhaust the immediate-completion poller", async () => {
     const rpc = fakeRpc();
     rpc.respond("prompt", undefined);
@@ -442,6 +463,14 @@ describe("RpcChildSession", () => {
     rpc.exit({ code: 0, signal: null });
     await session.abort();
     expect(rpc.sent).toHaveLength(2);
+  });
+
+  test("steer on a dead child fails at once instead of waiting out the control timeout", async () => {
+    const rpc = fakeRpc();
+    const session = new RpcChildSession(rpc, { sessionFile: undefined });
+    rpc.exit({ code: 1, signal: null });
+    await expect(session.steer("too late")).rejects.toThrow("exited before settling");
+    expect(rpc.sent).toEqual([]);
   });
 
   test("dispose sends SIGTERM and resolves only once the process has exited", async () => {

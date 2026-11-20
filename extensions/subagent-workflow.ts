@@ -25,6 +25,8 @@ import { encodeCwd, persistReconciledProjection } from "../src/store/run-store.j
 import { jsonObject, readRunSnapshot, type RunSnapshot } from "../src/store/run-snapshot.js";
 import { applyLiveWorkflowSettings, globalWorkflowSettings } from "../src/settings/runtime.js";
 import { fenceDirectlyDeliveredRun, registerSubagentTool, resolveFollowUpSpec } from "../src/tool/subagent-tool.js";
+import { registerSubagentMessageTool } from "../src/tool/subagent-message-tool.js";
+import { registerSubagentStopTool } from "../src/tool/subagent-stop-tool.js";
 import { registerEntryMarkers } from "../src/ui/entry-markers.js";
 import { registerNavigator, type NavigatorFollowUp, type NavigatorOpenContext } from "../src/ui/navigator/navigator.js";
 import { FOLLOW_UP_PROMPT_PREFIX } from "../src/ui/navigator/transcript.js";
@@ -265,21 +267,34 @@ function catchUpDetails(
 ): Pick<CatchUpRun, "interruptedChildCount" | "lastActivityAt" | "reason" | "recommendedAction"> {
   const interruptedChildCount = interruptedChildIds.length;
   const lastActivityAt = projectionLastActivityAt(snapshot, liveProjection);
+  const unconfirmed = unconfirmedMessageCount(snapshot);
+  const unconfirmedNote = unconfirmed === 0 ? "" : `; ${unconfirmed} parent message${unconfirmed === 1 ? "" : "s"} not confirmed delivered`;
   if (interruptedChildCount > 0) {
     const agent = interruptedChildCount === 1 ? "agent was" : "agents were";
     return {
       interruptedChildCount,
       ...(lastActivityAt === undefined ? {} : { lastActivityAt }),
-      reason: `parent process exited while ${interruptedChildCount} ${agent} running`,
+      reason: `parent process exited while ${interruptedChildCount} ${agent} running${unconfirmedNote}`,
       recommendedAction: status === "completed" ? "review result from" : "restart or resume from",
     };
   }
   return {
     interruptedChildCount,
     ...(lastActivityAt === undefined ? {} : { lastActivityAt }),
-    reason: "run finished before its result was delivered",
+    reason: `run finished before its result was delivered${unconfirmedNote}`,
     recommendedAction: status === "completed" ? "review result from" : "inspect or resume from",
   };
+}
+
+/** Parent messages a persisted terminal result reports as unconfirmed. In-flight tracking dies with the parent process. */
+function unconfirmedMessageCount(snapshot: RunSnapshot): number {
+  let count = 0;
+  for (const value of snapshot.events) {
+    const event = jsonObject(value);
+    const messages = event?.type === "result" ? jsonObject(event.result)?.unconfirmedMessages : undefined;
+    if (Array.isArray(messages)) count += messages.length;
+  }
+  return count;
 }
 
 function projectionInterruptedChildIds(liveProjection: RunProjection, projection: RunProjection): string[] {
@@ -343,6 +358,8 @@ export default function subagentWorkflow(pi: ExtensionAPI): void {
   };
   registerEntryMarkers(pi);
   registerSubagentTool(pi, selfPath, widget);
+  registerSubagentMessageTool(pi, subagentRunner);
+  registerSubagentStopTool(pi, subagentRunner);
   const policy = () => settings.get().workflowApproval;
   const observeRun = (run: StartedWorkflow, ctx: ExtensionContext) => {
     usageFooter.trackRun(run.runDir, ctx);

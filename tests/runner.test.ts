@@ -16,17 +16,17 @@ import { WorkflowRunError } from "../src/workflow/workflow-runner.js";
 
 const zeroUsage = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 });
 
-test("runner hot reload ignores the old v16 process singleton", async () => {
+test("runner hot reload ignores the old v17 process singleton", async () => {
   const moduleUrl = new URL("../src/runner/runner.ts", import.meta.url).href;
   const script = [
-    "const oldKey = '__piSubagentWorkflowRunner_v16__';",
-    "const currentKey = '__piSubagentWorkflowRunner_v17__';",
+    "const oldKey = '__piSubagentWorkflowRunner_v17__';",
+    "const currentKey = '__piSubagentWorkflowRunner_v18__';",
     "const sentinel = {};",
     "globalThis[oldKey] = sentinel;",
     "const { subagentRunner } = await import(" + JSON.stringify(moduleUrl) + ");",
-    "if (subagentRunner === sentinel) throw new Error('reused v16 runner');",
-    "if (globalThis[currentKey] !== subagentRunner) throw new Error('v17 runner not installed');",
-    "if (globalThis[oldKey] !== sentinel) throw new Error('v16 runner entry changed');",
+    "if (subagentRunner === sentinel) throw new Error('reused v17 runner');",
+    "if (globalThis[currentKey] !== subagentRunner) throw new Error('v18 runner not installed');",
+    "if (globalThis[oldKey] !== sentinel) throw new Error('v17 runner entry changed');",
   ].join(String.fromCharCode(10));
   const probe = Bun.spawn(["bun", "-e", script], { stdout: "ignore", stderr: "pipe" });
   try {

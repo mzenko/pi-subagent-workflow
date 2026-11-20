@@ -95,6 +95,28 @@ export interface SubagentResult {
   usage: UsageSummary;
   /** The fully-resolved spec the child actually ran with (for journaling/UI). */
   resolved: ResolvedSpec;
+  /**
+   * Parent-model messages (subagent_message) the child was never seen to
+   * receive before it stopped. Absent when every message arrived or none was
+   * sent. Previews only: the full text stays in the parent's own transcript.
+   */
+  unconfirmedMessages?: UnconfirmedParentMessage[];
+}
+
+/** A parent message whose arrival in the child conversation was not observed. */
+export interface UnconfirmedParentMessage {
+  /** Message id returned by subagent_message (e.g. "m2"). */
+  messageId: string;
+  /** Bounded single-line preview of the message text. */
+  preview: string;
+}
+
+/** Receipt for a parent message accepted for a live child. */
+export interface ParentMessageReceipt {
+  childId: string;
+  messageId: string;
+  /** "queued": handed to the running child; "buffered": held until the queued child starts. */
+  delivery: "queued" | "buffered";
 }
 
 /** Aggregated token/cost usage for a child run. */
@@ -145,7 +167,7 @@ export interface SubagentHandle {
   startedAt: number;
   /** Resolves with the terminal result (never rejects; failures are results). */
   result: Promise<SubagentResult>;
-  /** Send a steering message to the child mid-run (buffered until ready). */
+  /** Send a steering message to the child mid-run (buffered until it starts). Rejects once the child is finishing or finished. */
   steer(text: string): Promise<void>;
   abort(): Promise<void>;
   /** Subscribe to live events; returns unsubscribe. */
