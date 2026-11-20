@@ -47,7 +47,6 @@ const WIDGET_KEY = "subagent-workflow";
 const STATUS_KEY = "subagent-workflow";
 const FALLBACK_ROW_CAP = 6;
 const LABEL_WIDTH = 26;
-const REFRESH_MS = 100;
 
 type WidgetCtx = Pick<ExtensionContext, "ui" | "hasUI">;
 
