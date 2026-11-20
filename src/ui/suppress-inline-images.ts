@@ -143,7 +143,7 @@ function kittyAnchorAbove(lines: readonly string[], viewportStart: number): numb
  */
 function imageBlockEnd(lines: readonly string[], anchor: number): number {
   const last = anchor + (kittyRows(lines[anchor]!) ?? MAX_IMAGE_ROWS) - 1;
-  for (let row = anchor + 1; row <= last; row += 1) {
+  for (let row = anchor + 1; row <= last && row < lines.length; row += 1) {
     const line = lines[row] ?? "";
     if (isImageLine(line) || visibleWidth(line) > 0) return row - 1;
   }

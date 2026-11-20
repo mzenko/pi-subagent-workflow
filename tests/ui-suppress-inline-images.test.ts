@@ -197,6 +197,15 @@ describe("images anchored above the regular-mode viewport", () => {
     expect(run(lines)[0]).toBe(kitty(5));
   });
 
+  test("a huge declared row count does not scan past the frame", () => {
+    // Blank rows run from the anchor to the end of the frame, as when the
+    // image is the last thing in the transcript.
+    const lines = [...history, kitty(2 ** 31), ...Array(10).fill("")];
+    const started = performance.now();
+    expect(run(lines)[30]).toBe("");
+    expect(performance.now() - started).toBeLessThan(1_000);
+  });
+
   test("a frame the overlay did not change is returned as is", () => {
     const lines = [...history, kitty(5), "", "", "", "", ...Array(6).fill("tail")];
     expect(blankImageAnchorsAbovePanel(lines, [...lines], 10)[30]).toBe(kitty(5));

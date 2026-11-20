@@ -465,6 +465,25 @@ test("a worktree child that stops cooperatively but fails collection is reported
   expect((await handle.result).status).toBe("failed");
 });
 
+test("a child that honors the stop but is slow to tear down is not abandoned", async () => {
+  const disposal = gate();
+  const disposing = gate();
+  const grace = gate();
+  const child = controllableSession({ dispose: async () => { disposing.open(); await disposal.promise; } });
+  // The settle grace elapses only once teardown has started.
+  const runner = new SubagentRunner(async () => ({ session: child.session, resolved }), new Semaphore(1), temporaryStore, () => grace.promise);
+  const handle = runner.spawnRun({ prompt: "work" }, parent(), { parentAddressable: true });
+  await child.started;
+
+  const stopping = runner.stopForParent(handle.id, "parent");
+  await disposing.promise;
+  grace.open();
+  await Bun.sleep(0);
+  disposal.open();
+  expect(await stopping).toEqual({ runId: handle.runId, kind: "subagent", status: "stopped" });
+  expect((await handle.result).status).toBe("aborted");
+});
+
 test("subagent_stop refuses a workflow child or /agents follow-up by id", async () => {
   const child = controllableSession();
   const runner = runnerFor(child.session);

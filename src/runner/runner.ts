@@ -288,7 +288,10 @@ class Handle implements SubagentHandle {
         abortAndSettle.then(() => false),
         this.runner.waitForSettleGrace().then(() => true),
       ]);
-      if (graceElapsed) {
+      // A child whose prompt already returned honored the abort; what is still
+      // running is teardown and worktree collection, which publish the real
+      // result. Abandoning it would report a failure and discard the patch.
+      if (graceElapsed && !this.promptSettled) {
         this.runner.abandonChild(this, `Child did not settle within ${SETTLE_GRACE_MS / 1_000}s of abort; terminated after the grace period`);
       }
       return;
