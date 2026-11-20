@@ -39,6 +39,7 @@ const panel: Component = {
 };
 
 const places = (frame: string): boolean => /\x1b_G[^;\x1b]*a=[Tp]/.test(frame);
+const transmits = (frame: string): boolean => /\x1b_G[^;\x1b]*a=T/.test(frame);
 const deletes = (frame: string): boolean => /\x1b_G[^;\x1b]*a=d/.test(frame);
 const scrollbackRewrites = (frame: string): number => (frame.match(/\x1b\[3J/g) ?? []).length;
 
@@ -83,6 +84,9 @@ describe.each(RENDERERS)("%s", (_name, Kind) => {
     expect(places(frames.open)).toBe(false);
     expect(places(frames.repaint)).toBe(false);
     expect(places(frames.closed)).toBe(true);
+    // kitty discards the data of an image left without a placement, so a bare
+    // re-placement after close would draw nothing: the data must be re-sent.
+    expect(transmits(frames.closed)).toBe(true);
   });
 });
 

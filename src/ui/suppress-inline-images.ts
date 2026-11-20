@@ -153,6 +153,28 @@ function imageBlockEnd(lines: readonly string[], anchor: number): number {
 interface PatchEntry {
   depth: number;
   original: Composite;
+  /** Kitty image ids this patch has hidden, to re-upload on restore. */
+  hidden: Set<string>;
+}
+
+/** The Kitty image id (`i=`) of an image line, if any. */
+function kittyImageId(line: string): string | undefined {
+  const controls = line.slice(line.indexOf(KITTY) + KITTY.length).split(";", 1)[0] ?? "";
+  return /(?:^|,)i=(\d+)(?:,|$)/.exec(controls)?.[1];
+}
+
+/**
+ * Make pi upload hidden images again instead of only re-placing them. pi's
+ * fullscreen renderer remembers which images the terminal holds and, for
+ * those, sends a bare placement. kitty discards image data left without a
+ * placement (observed in kitty 0.50; Ghostty keeps it), so after the panel
+ * closes that bare placement would draw nothing. Forgetting the upload makes
+ * the next frame send the image data with its placement.
+ */
+function forgetUploads(tui: TUI, ids: ReadonlySet<string>): void {
+  const uploaded = (tui as unknown as { uploadedKittyImages?: unknown }).uploadedKittyImages;
+  if (!(uploaded instanceof Map)) return;
+  for (const id of ids) uploaded.delete(Number(id));
 }
 
 const patched = new WeakMap<TUI, PatchEntry>();
@@ -169,7 +191,8 @@ export function suppressInlineImages(tui: TUI): () => void {
     // prototype compositeOverlays (test fakes, future pi-tui shapes) just
     // keeps its images.
     if (!original) return () => {};
-    entry = { depth: 0, original };
+    entry = { depth: 0, original, hidden: new Set() };
+    const hidden = entry.hidden;
     patched.set(tui, entry);
     (tui as unknown as { compositeOverlays: Composite }).compositeOverlays = function (
       this: TUI, lines: string[], termWidth: number, termHeight: number,
@@ -192,7 +215,14 @@ export function suppressInlineImages(tui: TUI): () => void {
       const composited = original.call(this, input, termWidth, termHeight);
       if (!active) return composited;
       try {
-        return blankImageAnchorsAbovePanel(input, composited, termHeight);
+        const output = blankImageAnchorsAbovePanel(input, composited, termHeight);
+        // Blanked before compositing (viewport) or after (anchor above it).
+        lines.forEach((line, index) => {
+          if (!line.includes(KITTY) || (input[index] === line && output[index] === line)) return;
+          const id = kittyImageId(line);
+          if (id !== undefined) hidden.add(id);
+        });
+        return output;
       } catch {
         return composited;
       }
@@ -212,7 +242,12 @@ export function suppressInlineImages(tui: TUI): () => void {
     // behaviorally identical to no own property at all.
     (tui as unknown as { compositeOverlays: Composite }).compositeOverlays = current.original;
     patched.delete(tui);
-    // The restored method stops blanking; request the pass that re-places the image.
+    try {
+      forgetUploads(tui, current.hidden);
+    } catch {
+      // Best effort: at worst a hidden kitty image stays missing until pi re-sends it.
+    }
+    // The restored method stops blanking; request the pass that restores the image.
     tui.requestRender();
   };
 }
