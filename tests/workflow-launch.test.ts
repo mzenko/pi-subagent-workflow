@@ -1,4 +1,4 @@
-import { expect, spyOn, test } from "bun:test";
+import { expect, test } from "bun:test";
 import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -601,17 +601,3 @@ test("background delivery keeps the activity summary ahead of a truncated result
   expect(delivery).toContain("Tool activity:\nworker [child-1]: read x1");
   expect(delivery.indexOf("Tool activity")).toBeLessThan(delivery.indexOf("workflow_result"));
 });
-
-function writeProtocolWorkflow(runDir: string, runId: string, generation: number): void {
-  writeFileSync(join(runDir, "run.json"), `${JSON.stringify({
-    v: 3,
-    runId,
-    kind: "workflow",
-    createdAt: "2026-01-01T00:00:00.000Z",
-    parent: { sessionId: "parent" },
-    children: [],
-    delivery: { protocol: 1, generation },
-  })}\n`);
-  writeFileSync(join(runDir, "status.json"), `${JSON.stringify({ status: "completed", children: {} })}\n`);
-  writeFileSync(join(runDir, "events.jsonl"), "");
-}

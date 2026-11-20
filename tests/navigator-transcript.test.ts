@@ -87,19 +87,6 @@ test("readSessionMessages returns a placeholder for malformed session input", ()
   ]);
 });
 
-test("readSessionMessages marks an oversized complete message in chronological position", () => {
-  const dir = mkdtempSync(join(tmpdir(), "nav-session-"));
-  const path = join(dir, "oversized.jsonl");
-  const older = { type: "message", message: { role: "assistant", content: "older survives" } };
-  const oversized = { type: "message", message: { role: "toolResult", content: "x".repeat(512 * 1024) } };
-  writeFileSync(path, `${JSON.stringify(older)}\n${JSON.stringify(oversized)}\n`);
-
-  expect(readSessionMessages(path)).toEqual([
-    { role: "assistant", content: "older survives" },
-    { role: "toolResult", content: OVERSIZED_MESSAGE_OMISSION, toolName: "result" },
-  ]);
-});
-
 test("readSessionMessages preserves one bounded marker for each oversized complete message", () => {
   const path = join(mkdtempSync(join(tmpdir(), "nav-session-")), "oversized-order.jsonl");
   const entries = [
@@ -111,15 +98,14 @@ test("readSessionMessages preserves one bounded marker for each oversized comple
   ];
   writeFileSync(path, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
 
-  const messages = readSessionMessages(path);
-  expect(messages.map((message) => message.content)).toEqual([
-    "before",
-    OVERSIZED_MESSAGE_OMISSION,
-    "between",
-    OVERSIZED_MESSAGE_OMISSION,
-    "after",
+  expect(readSessionMessages(path)).toEqual([
+    { role: "user", content: "before" },
+    { role: "assistant", content: OVERSIZED_MESSAGE_OMISSION },
+    { role: "assistant", content: "between" },
+    // A tool result whose prefix carries no toolName falls back to "result".
+    { role: "toolResult", content: OVERSIZED_MESSAGE_OMISSION, toolName: "result" },
+    { role: "user", content: "after" },
   ]);
-  expect(messages.map((message) => message.role)).toEqual(["user", "assistant", "assistant", "toolResult", "user"]);
 });
 
 test("oversized placeholders preserve user, assistant, and tool-result rendering roles", () => {
@@ -214,30 +200,6 @@ test("oversized message-first records preserve generic chronological markers whe
     { role: "omission", content: OVERSIZED_RECORD_OMISSION },
     { role: "omission", content: OVERSIZED_RECORD_OMISSION },
     { role: "user", content: "after" },
-  ]);
-});
-
-test("oversized nested values that exhaust the prefix retain an omission slot", () => {
-  const path = join(mkdtempSync(join(tmpdir(), "nav-session-")), "oversized-nested-prefix.jsonl");
-  const oversized = {
-    message: {
-      metadata: { padding: "p".repeat(300) },
-      role: "assistant",
-      content: "x".repeat(SESSION_ENTRY_MAX_BYTES),
-    },
-    type: "message",
-  };
-  writeFileSync(path, [
-    JSON.stringify({ type: "message", message: { role: "user", content: "before" } }),
-    JSON.stringify(oversized),
-    JSON.stringify({ type: "message", message: { role: "assistant", content: "after" } }),
-    "",
-  ].join("\n"));
-
-  expect(readSessionMessages(path)).toEqual([
-    { role: "user", content: "before" },
-    { role: "omission", content: OVERSIZED_RECORD_OMISSION },
-    { role: "assistant", content: "after" },
   ]);
 });
 

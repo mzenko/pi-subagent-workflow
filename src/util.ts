@@ -8,6 +8,16 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+/** Text of a user message exactly as pi compares queued steers (string, or joined text blocks). */
+export function userMessageText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((part): part is { type: "text"; text: string } => isRecord(part) && part.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("");
+}
+
 /** Display label for a spec: explicit label, else a trimmed slice of the prompt. */
 export function childLabel(spec: { label?: string; prompt: string }): string {
   return spec.label?.trim() || spec.prompt.trim().replace(/\s+/g, " ").slice(0, 60) || "Subagent";

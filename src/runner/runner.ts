@@ -2,14 +2,14 @@ import { randomUUID } from "node:crypto";
 import { cpus } from "node:os";
 import { performance } from "node:perf_hooks";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import type { FollowUpReference, ResolvedSpec, SubagentEvent, SubagentHandle, SubagentResult, SubagentSpec, SubagentStatus, UsageSummary } from "../types.js";
+import type { FollowUpReference, ParentMessageReceipt, ParentStopReceipt, ResolvedSpec, SubagentEvent, SubagentHandle, SubagentResult, SubagentSpec, SubagentStatus, UsageSummary } from "../types.js";
 import { cloneActivityFold, type RunActivityFold } from "../store/activity-fold.js";
 import { cloneRunProjection, foldRunProjection as foldProjection, projectRunSnapshot, type RunProjection, type RunProjectionEvent } from "../store/run-projection.js";
 import { readRunSnapshot, type RunSnapshot } from "../store/run-snapshot.js";
 import { EMPTY_USAGE, RunStore } from "../store/run-store.js";
 import { writeSessionClosedMarker } from "../store/session-closed-marker.js";
 import { reportDiagnostic } from "../diagnostics.js";
-import { errorMessage } from "../util.js";
+import { errorMessage, userMessageText } from "../util.js";
 import { followUpSpawn, submittedSpec, type ChildSpawnSpec, type ParentContext } from "./child.js";
 import { spawnSubprocessChild } from "./subprocess/spawn-child.js";
 import type { ChildSession } from "./child-session.js";
@@ -38,6 +38,17 @@ interface SpawnRunOptions {
   store?: RunStore;
   /** Results go directly to a human; persisted in run.json before any child starts. */
   directDelivery?: boolean;
+  /** The parent model may message or stop this child (subagent tool spawns only). */
+  parentAddressable?: boolean;
+}
+
+/** Longest single-line preview of a parent message kept in a result. */
+const MESSAGE_PREVIEW_MAX = 80;
+
+function messagePreview(text: string): string {
+  const line = text.replace(/\s+/g, " ").trim();
+  const chars = Array.from(line);
+  return chars.length <= MESSAGE_PREVIEW_MAX ? line : `${chars.slice(0, MESSAGE_PREVIEW_MAX - 1).join("")}…`;
 }
 
 const SETTLE_GRACE_MS = 15_000;
@@ -79,6 +90,20 @@ class Handle implements SubagentHandle {
   private resolveResult!: (result: SubagentResult) => void;
   private listeners = new Set<(event: SubagentEvent) => void>();
   private steering: string[] = [];
+  /** True while buffered steers are being handed to a new session; later steers queue behind them. */
+  private flushingSteering = false;
+  /**
+   * One-way latch: once the child starts stopping (abort, timeout, session
+   * teardown, or a terminal result) no steer may be accepted. Without it a
+   * steer in the gap between session disposal and finish() - worktree
+   * collection runs there - would be buffered and never drained.
+   */
+  private steeringClosed = false;
+  /** Parent-model messages sent or buffered but not yet seen in the child conversation. */
+  private unconfirmedParentMessages: Array<{ messageId: string; text: string; preview: string }> = [];
+  private parentMessageCounter = 0;
+  /** Parent session id, captured once: the parent ctx can go stale after a session replacement. */
+  readonly parentSessionId: string;
   private terminal?: SubagentResult;
   private eventUnsubscribe?: () => void;
   private sessionDisposal?: Promise<void>;
@@ -86,6 +111,13 @@ class Handle implements SubagentHandle {
   private aborting?: Promise<void>;
   private externalCancellationRequested = false;
   private startupDetached = false;
+  /**
+   * The prompt has returned and its outcome is fixed; what remains is session
+   * shutdown and worktree collection. A stop now would not change the result.
+   */
+  promptSettled = false;
+  /** Killed by the runner after ignoring cancellation past the settle grace. */
+  abandoned = false;
   /** Set while the initial run is executing runPrompt. */
   inFlightPrompt?: Promise<SubagentResult>;
   /** Idempotent release for the initial semaphore admission. */
@@ -95,7 +127,10 @@ class Handle implements SubagentHandle {
   /** Initial admission, construction, prompt, and cleanup task. */
   private startup?: Promise<void>;
   constructor(readonly id: string, spawnSpec: ChildSpawnSpec, readonly runId: string, readonly runDir: string,
-    readonly generation: number, private store: RunStore, private runner: SubagentRunner, readonly parent: ParentContext) {
+    readonly generation: number, private store: RunStore, private runner: SubagentRunner, readonly parent: ParentContext,
+    /** Whether the parent model may message or stop this child (subagent tool spawns only). */
+    readonly parentAddressable = false) {
+    this.parentSessionId = parent.ctx.sessionManager.getSessionId();
     this.spec = submittedSpec(spawnSpec);
     const followUp = followUpSpawn(spawnSpec);
     this.forkSessionFile = followUp?.forkSessionFile;
@@ -125,6 +160,17 @@ class Handle implements SubagentHandle {
   setStatus(status: SubagentStatus): void { this.status = status; this.emit({ type: "status", id: this.id, status }); }
   finish(result: SubagentResult): void {
     if (this.terminal) return;
+    this.steeringClosed = true;
+    // Every terminal path (admission abort, construction failure, timeout,
+    // abandonment, schema self-abort, normal completion) passes through here,
+    // after the last child event that could confirm a message.
+    if (this.unconfirmedParentMessages.length > 0) {
+      result = {
+        ...result,
+        unconfirmedMessages: this.unconfirmedParentMessages.map(({ messageId, preview }) => ({ messageId, preview })),
+      };
+      this.unconfirmedParentMessages = [];
+    }
     this.terminal = result;
     // The result event already carries the terminal status. Persist and emit it
     // once so RunStore can release ownership only after the complete result is
@@ -134,14 +180,80 @@ class Handle implements SubagentHandle {
     this.resolveResult(result);
     this.runner.childFinished(this.runId);
   }
-  async steer(text: string): Promise<void> { if (this.session) return this.session.steer(text); this.steering.push(text); }
-  async flushSteering(): Promise<void> { for (const text of this.steering.splice(0)) await this.session?.steer(text); }
+  async steer(text: string): Promise<void> { await this.send(text); }
+  private async send(text: string): Promise<ParentMessageReceipt["delivery"]> {
+    this.assertSteerable();
+    if (this.session && !this.flushingSteering) {
+      await this.session.steer(text);
+      return "queued";
+    }
+    // Buffering is only legal before construction (and behind a flush in
+    // progress, so a newer message never overtakes an older buffered one);
+    // the latch rules out the post-disposal window where no flush will run.
+    this.steering.push(text);
+    return "buffered";
+  }
+  /**
+   * Send a parent-model message. The wrapper names the sender, carries an id
+   * the child-side arrival is matched on, and keeps pi from treating the text
+   * as a slash command or prompt template, so the sent text is exactly the
+   * text that arrives. The message is tracked before sending and dropped from
+   * tracking only if the send itself is rejected.
+   */
+  async steerFromParent(text: string): Promise<ParentMessageReceipt> {
+    this.assertSteerable();
+    const messageId = `m${++this.parentMessageCounter}`;
+    const wrapped = `[Message ${messageId} from your parent agent]\n${text}`;
+    const entry = { messageId, text: wrapped, preview: messagePreview(text) };
+    this.unconfirmedParentMessages.push(entry);
+    try {
+      return { childId: this.id, messageId, delivery: await this.send(wrapped) };
+    } catch (error) {
+      this.unconfirmedParentMessages = this.unconfirmedParentMessages.filter((tracked) => tracked !== entry);
+      throw error;
+    }
+  }
+  /** A user message entered the child conversation; confirm one matching parent message. */
+  noteUserMessage(text: string): void {
+    const index = this.unconfirmedParentMessages.findIndex((entry) => entry.text === text);
+    if (index !== -1) this.unconfirmedParentMessages.splice(index, 1);
+  }
+  async flushSteering(): Promise<void> {
+    this.flushingSteering = true;
+    try {
+      // Drain in arrival order, including steers that arrive mid-flush.
+      for (let text = this.steering.shift(); text !== undefined; text = this.steering.shift()) {
+        // A child stopped mid-flush must not hold its admission slot while the
+        // rest of the backlog is sent; unsent parent messages stay unconfirmed.
+        if (this.steeringClosed) {
+          this.steering = [];
+          return;
+        }
+        try {
+          await this.session?.steer(text);
+        } catch (error) {
+          // A lost steer must not fail the child. A parent message stays
+          // unconfirmed and is reported in the result.
+          reportDiagnostic(`[subagent-workflow] buffered steer for child ${this.id} failed: ${errorMessage(error)}`);
+        }
+      }
+    } finally {
+      this.flushingSteering = false;
+    }
+  }
+  private assertSteerable(): void {
+    if (this.terminal) throw new Error(`Subagent ${this.id} has finished and cannot receive messages`);
+    if (this.steeringClosed) throw new Error(`Subagent ${this.id} is finishing and cannot receive messages; wait for its result`);
+  }
   get isTerminal(): boolean { return this.terminal !== undefined; }
   /** Whether the handle is doing live work right now. */
   get isLive(): boolean { return this.status === "pending" || this.status === "running"; }
   get isDisposingSession(): boolean { return this.sessionDisposal !== undefined; }
   get wasExternallyCancelled(): boolean { return this.externalCancellationRequested; }
-  markExternalCancellation(): void { this.externalCancellationRequested = true; }
+  markExternalCancellation(): void {
+    this.externalCancellationRequested = true;
+    this.steeringClosed = true;
+  }
   abort(): Promise<void> {
     this.markExternalCancellation();
     if (this.aborting) return this.aborting;
@@ -176,7 +288,10 @@ class Handle implements SubagentHandle {
         abortAndSettle.then(() => false),
         this.runner.waitForSettleGrace().then(() => true),
       ]);
-      if (graceElapsed) {
+      // A child whose prompt already returned honored the abort; what is still
+      // running is teardown and worktree collection, which publish the real
+      // result. Abandoning it would report a failure and discard the patch.
+      if (graceElapsed && !this.promptSettled) {
         this.runner.abandonChild(this, `Child did not settle within ${SETTLE_GRACE_MS / 1_000}s of abort; terminated after the grace period`);
       }
       return;
@@ -219,6 +334,7 @@ class Handle implements SubagentHandle {
     await this.constructionAbort?.catch(() => undefined);
   }
   async disposeSession(): Promise<void> {
+    this.steeringClosed = true;
     this.clearEventSubscription();
     if (this.sessionDisposal) return this.sessionDisposal;
     const session = this.session;
@@ -338,6 +454,7 @@ export class SubagentRunner {
   /** @internal Settle a child whose RPC process ignored cancellation, then terminate it. */
   abandonChild(handle: Handle, reason: string): void {
     if (handle.isTerminal) return;
+    handle.abandoned = true;
     // Settle the result immediately; disposal below kills the child process.
     handle.finish(this.failure(handle, reason));
     handle.releaseAdmission?.();
@@ -384,7 +501,7 @@ export class SubagentRunner {
     // Strip the kind prefix, whatever it is: slice(4) assumed "run-" and
     // turned workflow run ids into "subagent-flow-..." child ids.
     const id = `subagent-${runId.replace(/^[a-z]+-/, "")}-${this.nonce}-${(++this.childCounter).toString(36)}`;
-    const handle = new Handle(id, spec, runId, store.runDir, identity.generation, store, this, parent);
+    const handle = new Handle(id, spec, runId, store.runDir, identity.generation, store, this, parent, options.parentAddressable === true);
     // Persist the child before it starts. If ownership was lost, the
     // unreturned child cannot run as an orphan and no fenced store is
     // retained in the runner registry.
@@ -424,6 +541,26 @@ export class SubagentRunner {
   }
 
   get(id: string): SubagentHandle | undefined { return this.handles.get(id); }
+  /**
+   * The child this parent session spawned with the subagent tool, by child id
+   * or run id (a subagent run has one child). Workflow children and private
+   * /agents follow-ups are never addressable, whatever ids the model finds on
+   * disk, and another session's child reads exactly like a missing one.
+   */
+  private parentChild(target: string, parentSessionId: string): Handle {
+    const handle = this.handles.get(target) ?? [...this.handles.values()].find((candidate) => candidate.runId === target);
+    if (!handle || handle.parentSessionId !== parentSessionId) {
+      throw new Error(`No subagent ${JSON.stringify(target)} in this session; if it already finished, its result is delivered separately.`);
+    }
+    if (!handle.parentAddressable) {
+      throw new Error(`${JSON.stringify(target)} belongs to a workflow or an /agents follow-up and cannot be addressed by id; stop a workflow by its runId.`);
+    }
+    return handle;
+  }
+  /** Deliver a parent-model message to a live child this session spawned. */
+  async messageChild(target: string, parentSessionId: string, text: string): Promise<ParentMessageReceipt> {
+    return this.parentChild(target, parentSessionId).steerFromParent(text);
+  }
   /** Live handles belonging to a run, for the navigator's live overlay. */
   runHandles(runId: string): SubagentHandle[] { return [...this.handles.values()].filter((handle) => handle.runId === runId); }
   /** Seed a workflow projection from durable history before live execution resumes. */
@@ -507,6 +644,32 @@ export class SubagentRunner {
     }
     const live = [...this.handles.values()].filter((handle) => handle.runId === runId && handle.isLive);
     await Promise.all(live.map((handle) => handle.abort()));
+  }
+  /**
+   * Stop a run on the parent model's behalf: a workflow this session started
+   * (by run id), or a subagent-tool child (by child id or run id). Resolves
+   * once the run has settled, as an /agents stop does, and reports what the
+   * child's result will actually say.
+   */
+  async stopForParent(target: string, parentSessionId: string): Promise<ParentStopReceipt> {
+    if (this.runControllers.get(target)?.parentSessionId === parentSessionId) {
+      await this.stopRun(target);
+      return { runId: target, kind: "workflow", status: "stopped" };
+    }
+    const handle = this.parentChild(target, parentSessionId);
+    const receipt = { runId: handle.runId, kind: "subagent" as const };
+    // Once the prompt has returned, the result is fixed; a stop would only
+    // claim a cancellation that did not happen.
+    if (!handle.isLive || handle.promptSettled) return { ...receipt, status: "already-finished" };
+    await handle.abort();
+    const result = await handle.result;
+    const error = result.error === undefined ? {} : { error: result.error };
+    // Killed after ignoring the abort past the settle grace.
+    if (handle.abandoned) return { ...receipt, status: "terminated", ...error };
+    // Finished on its own between the check above and the abort.
+    if (result.status === "completed") return { ...receipt, status: "already-finished" };
+    // Stopped; it may still fail afterwards (e.g. worktree collection).
+    return { ...receipt, status: "stopped", ...error };
   }
   /** Whether the run has live work or a registered workflow loop in THIS process; guards same-process duplicate resume. */
   isRunActive(runId: string): boolean {
@@ -624,6 +787,7 @@ export class SubagentRunner {
       // worktree patch and yields an aborted result) instead of racing it.
       const runAndFinish = (async (): Promise<SubagentResult> => {
         const result = await this.runPrompt(handle, handle.spec.prompt, agentTimeoutMinutes);
+        handle.promptSettled = true;
         releaseAdmission();
         // Shutdown hooks can make final worktree writes. Dispose the session
         // before collecting so those writes are included in the patch.
@@ -705,6 +869,17 @@ export class SubagentRunner {
   private subscribe(handle: Handle): void {
     const session = handle.session;
     const unsubscribe = session?.subscribe((event) => {
+      if (event.type === "message_start" && event.message.role === "user") {
+        handle.noteUserMessage(userMessageText(event.message.content));
+      }
+      // pi's abort leaves queued steers in place and then continues the
+      // session on them, so a stopped child with an unread message would start
+      // a fresh run. Abort that run too; each re-abort drains one message.
+      if (event.type === "agent_start" && handle.wasExternallyCancelled) {
+        void session.abort().catch((error: unknown) => {
+          reportDiagnostic(`[subagent-workflow] re-abort of cancelled child ${handle.id} failed: ${errorMessage(error)}`);
+        });
+      }
       if (event.type === "tool_execution_start") {
         const activityEvent = { type: "activity" as const, id: handle.id, description: summarizeCall(event.toolName, event.args) };
         handle.emit(activityEvent);
@@ -796,7 +971,7 @@ function summarizeCall(name: string, args: unknown): string {
 // Bump whenever Handle/SubagentRunner state or behavior changes incompatibly.
 // A separate key from the semaphore lets a hot reload adopt the new runner
 // without temporarily creating a second concurrency pool.
-const RUNNER_STATE_VERSION = "v17";
+const RUNNER_STATE_VERSION = "v18";
 const RUNNER_KEY = `__piSubagentWorkflowRunner_${RUNNER_STATE_VERSION}__`;
 const runnerScope = globalThis as unknown as Record<string, SubagentRunner | undefined>;
 export const subagentRunner: SubagentRunner = runnerScope[RUNNER_KEY] ??= new SubagentRunner();

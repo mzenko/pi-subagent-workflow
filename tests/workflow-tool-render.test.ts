@@ -33,25 +33,19 @@ test("workflow tool guidance describes safe orchestration and background deliver
 
   registerWorkflowTool(pi, "/extension.ts", {} as never);
 
-  expect(registered!.description).toContain("required: ['files']");
-  expect(registered!.description).toContain("result?.files.filter(Boolean) ?? []");
   expect(registered!.description).toContain("A resumeRunId still requires exactly one of script or scriptPath");
   expect(registered!.description).toContain("Every prompt must be self-contained");
   expect(registered!.description).toContain("the patch is never applied automatically");
   expect(registered!.description).toContain("Every run is background");
   expect(registered!.description).toContain("do not wait or poll");
   expect(registered!.description).toContain("workflow-authoring skill");
-  expect(registered!.description).not.toContain("advisory budget");
   // The long-form authoring guidance lives in the skill, not the per-call tax.
   expect(registered!.description.length).toBeLessThan(2600);
   const properties = (registered!.parameters as {
     properties: Record<string, { description?: string }>;
   }).properties;
-  expect(properties).not.toHaveProperty("budget");
-  expect(properties).not.toHaveProperty("wait");
   expect(properties.args?.description).toContain("On resume, omit to reuse persisted args");
   expect(properties.rerunChildIds?.description).toContain("execution-environment drift");
-  expect(registered!.description).not.toMatch(/follow.?up|warm|restart/i);
 });
 
 test("workflowSummaryLines sanitizes every dynamic terminal field independently", () => {

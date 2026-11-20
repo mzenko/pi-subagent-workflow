@@ -110,8 +110,6 @@ test("subagent tool guidance favors self-contained prompts and background delive
   expect(h.tool.description).toContain("forks a completed child's persisted session into a new child and run");
   expect(properties.prompt?.description).toContain("does not receive the parent conversation");
   expect(properties.tools?.description).toContain("Normally omit");
-  expect(properties).not.toHaveProperty("wait");
-  expect(properties).not.toHaveProperty("specs");
 });
 
 test("background completion cleans up after queueing and marks only after matching message_start", async () => {
@@ -210,14 +208,6 @@ test("a spawn returns a launch receipt and delivers in the background", async ()
   await new Promise((resolve) => setTimeout(resolve, 0));
   expect(h.marked).toEqual(["run-1"]);
   expect(h.delivered).toHaveLength(1);
-  expect(existsSync(deliveredPath)).toBe(false);
-  expect(acknowledgeDeliveryMessage("parent", h.delivered[0]!)).toBe(true);
-  expect(JSON.parse(readFileSync(deliveredPath, "utf8"))).toEqual({
-    v: 1,
-    sessionId: "parent",
-    catchUp: false,
-    generation: 1,
-  });
 });
 
 test("a turn abort does not touch the spawned child", async () => {

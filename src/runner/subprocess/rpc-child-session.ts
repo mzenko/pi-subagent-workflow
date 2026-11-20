@@ -6,7 +6,7 @@
 
 import type { AssistantMessage, AssistantMessageEvent, Message } from "@earendil-works/pi-ai";
 import type { UsageSummary } from "../../types.js";
-import { isRecord } from "../../util.js";
+import { isRecord, userMessageText } from "../../util.js";
 import type { ChildSession, ChildSessionEvent } from "../child-session.js";
 import type { ChildRpc } from "./rpc-transport.js";
 
@@ -51,6 +51,11 @@ function isRunActivity(event: ChildSessionEvent): boolean {
     || event.type === "turn_end"
     || event.type === "tool_execution_start"
     || event.type === "tool_execution_end";
+}
+
+function removeOne(list: string[], text: string): void {
+  const index = list.indexOf(text);
+  if (index !== -1) list.splice(index, 1);
 }
 
 /** Narrow the untyped JSONL transport to the events this repository consumes. */
@@ -217,6 +222,8 @@ export class RpcChildSession implements ChildSession {
   private promptAttempt = 0;
   private lifecycleEventsEnabled: boolean;
   private exitError: Error | undefined;
+  /** Steers pi acknowledged that have not yet entered the conversation. */
+  private unreadSteers: string[] = [];
   private disposal?: Promise<void>;
 
   constructor(private readonly rpc: ChildRpc, init: RpcChildSessionInit) {
@@ -297,7 +304,18 @@ export class RpcChildSession implements ChildSession {
   }
 
   async steer(text: string): Promise<void> {
-    await this.rpc.request({ type: "steer", message: text }, { timeoutMs: CONTROL_REQUEST_TIMEOUT_MS });
+    // A dead child would otherwise hold the caller for the full control timeout.
+    if (this.exitError) throw this.exitError;
+    // Track before sending so an arrival that beats the ack still matches.
+    // pi expands a leading "/" (skills, prompt templates), so that text never
+    // arrives verbatim and could not be matched off this list.
+    if (!text.startsWith("/")) this.unreadSteers.push(text);
+    try {
+      await this.rpc.request({ type: "steer", message: text }, { timeoutMs: CONTROL_REQUEST_TIMEOUT_MS });
+    } catch (error) {
+      removeOne(this.unreadSteers, text);
+      throw error;
+    }
   }
 
   async abort(): Promise<void> {
@@ -366,7 +384,10 @@ export class RpcChildSession implements ChildSession {
         poll -= 1;
         continue;
       }
-      if (state.pendingMessageCount > 0) {
+      // Our own steers stay queued when a prompt completes without a run (no
+      // loop ever drains them); only pending work beyond them means a run is
+      // still coming.
+      if (state.pendingMessageCount > this.unreadSteers.length) {
         idleObservations = 0;
         continue;
       }
@@ -381,6 +402,9 @@ export class RpcChildSession implements ChildSession {
   }
 
   private handleEvent(event: ChildSessionEvent): void {
+    if (event.type === "message_start" && event.message.role === "user") {
+      removeOne(this.unreadSteers, userMessageText(event.message.content));
+    }
     const activeTurn = this.turn;
     const assistantUpdate = knownAssistantMessageUpdate(event);
     if (activeTurn) {

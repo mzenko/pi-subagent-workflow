@@ -299,7 +299,7 @@ export function registerSubagentTool(pi: ExtensionAPI, selfPath: string, widget?
   runner: SubagentRunner = subagentRunner, resolveFollowUp: FollowUpResolver = resolveFollowUpSpec): void {
   const tool: ToolDefinition<typeof SubagentToolParameters, SubagentDetails | undefined> = {
     name: "subagent", label: "Subagent", parameters: SubagentToolParameters,
-    description: "Spawn one ad-hoc child. Each child starts cold with only its self-contained prompt and inherits the parent's provider/model and thinking level unless overridden ('provider/model-id', never a bare model name). Add schema (JSON Schema) for validated structured output. Use isolation: 'worktree' for parallel edits; changes return as a patch, never applied automatically. For several independent children, call this tool several times in the same turn - up to about eight; beyond that, or when results must feed later spawns, or you need phases, pipelines, or resumable control flow, use workflow instead. The global semaphore paces all spawns, so never batch to control concurrency. Every run is background: the call returns as soon as the child starts and its result arrives later as a steered message, so do not wait or poll - end the turn and continue when the message arrives. (In a host with no interactive UI the call instead blocks and returns the result inline.) followUp: { id, prompt } forks a completed child's persisted session into a new child and run; it inherits that child's model, thinking level, tools, schema, cwd, and isolation, so none of those may be set at the top level - label is the one exception and should name the new turn. Compose each child for the task at hand; recurring task shapes belong in skills, not fixed agent personas.",
+    description: "Spawn one ad-hoc child. Each child starts cold with only its self-contained prompt and inherits the parent's provider/model and thinking level unless overridden ('provider/model-id', never a bare model name). Add schema (JSON Schema) for validated structured output. Use isolation: 'worktree' for parallel edits; changes return as a patch, never applied automatically. For several independent children, call this tool several times in the same turn - up to about eight; beyond that, or when results must feed later spawns, or you need phases, pipelines, or resumable control flow, use workflow instead. The global semaphore paces all spawns, so never batch to control concurrency. Every run is background: the call returns as soon as the child starts and its result arrives later as a steered message, so do not wait or poll - end the turn and continue when the message arrives. To redirect or inform a child while it runs, use subagent_message with its id; to cancel it, use subagent_stop. (In a host with no interactive UI the call instead blocks and returns the result inline.) followUp: { id, prompt } forks a completed child's persisted session into a new child and run; it inherits that child's model, thinking level, tools, and cwd, but not its schema (worktree children cannot be continued at all), and none of those options may be set at the top level - label is the one exception and should name the new turn. Compose each child for the task at hand; recurring task shapes belong in skills, not fixed agent personas.",
     async execute(_toolCallId, params, signal, _onUpdate, ctx): Promise<Detailed> {
       let input: ValidatedSubagentInput;
       try { input = validateSubagentInput(params); } catch (error) { throw new Error(errorMessage(error)); }
@@ -322,7 +322,7 @@ export function registerSubagentTool(pi: ExtensionAPI, selfPath: string, widget?
         const resolved = resolveModel(spec, ctx, parent.thinkingLevel);
         display = { modelId: resolved.model.id, thinking: resolved.thinking };
       } catch { /* the child will fail (or not) on its own terms */ }
-      const handle = runner.spawnRun(spawnSpec, parent);
+      const handle = runner.spawnRun(spawnSpec, parent, { parentAddressable: true });
       const { runId, runDir } = handle;
       appendEntrySafely(pi, "subagent-workflow:run-started", {
         runId,
@@ -407,7 +407,10 @@ export function formatDelivery(runId: string, runDir: string, result: SubagentRe
       ? [`Failed child ${delivered.id} (${delivered.resolved.label}): ${delivered.error ?? "Unknown error"}`]
       : delivered.status === "aborted" ? [`Aborted child ${delivered.id} (${delivered.resolved.label})`] : [],
     recovery: delivered.status === "failed" ? ["Recovery: respawn the child with the same prompt and options."] : [],
-    warnings: degraded ? [`Warning: run persistence degraded (${safeDeliveryValue(degraded)}); the run directory may be incomplete`] : [],
+    warnings: [
+      ...(degraded ? [`Warning: run persistence degraded (${safeDeliveryValue(degraded)}); the run directory may be incomplete`] : []),
+      ...unconfirmedMessageWarning(delivered.id, result),
+    ],
     artifacts: [`Run record: ${runRecord}`],
     auxiliaryArtifacts: delivered.sessionFile === undefined ? [] : [`Child ${delivered.id} session: ${delivered.sessionFile}`],
     resultPreview: chunkDeliveryText(stringifyDeliveryJson({ type: "subagent_results", results: [delivered] })),
@@ -415,6 +418,19 @@ export function formatDelivery(runId: string, runDir: string, result: SubagentRe
       ? `[truncated - result may be incomplete at ${eventsRecord}; run persistence degraded]`
       : `[truncated - full result remains available via ${eventsRecord}]`,
   });
+}
+
+/**
+ * A parent message the child was never seen to receive. "Unconfirmed", not
+ * "lost": it may have arrived too late to be acted on, and nothing here can
+ * tell whether a message that did arrive changed what the child did.
+ */
+function unconfirmedMessageWarning(childId: string, result: SubagentResult): string[] {
+  const messages = Array.isArray(result.unconfirmedMessages) ? result.unconfirmedMessages : [];
+  if (messages.length === 0) return [];
+  const listed = messages.map((message) => `${safeDeliveryValue(message.messageId)} "${safeDeliveryValue(message.preview)}"`).join(", ");
+  const noun = messages.length === 1 ? "message was" : "messages were";
+  return [`Warning: ${messages.length} parent ${noun} not confirmed delivered to child ${childId} before it stopped (${listed}). If it still matters, continue the child with subagent followUp (unavailable for worktree children; drops any schema) or spawn a new one.`];
 }
 
 /**

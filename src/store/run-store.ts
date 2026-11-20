@@ -129,30 +129,12 @@ interface RunStoreOptions {
   existingSnapshot?: RunSnapshot;
 }
 
-interface StagingFileOperations {
-  open(path: string, flags: string, mode: number): number;
-  write(fd: number, buffer: Uint8Array, offset: number, length: number): number;
-  close(fd: number): void;
-  remove(path: string): void;
-}
-
-const STAGING_FILE_OPERATIONS: StagingFileOperations = {
-  open: (path, flags, mode) => openSync(path, flags, mode),
-  write: (fd, buffer, offset, length) => writeSync(fd, buffer, offset, length),
-  close: (fd) => closeSync(fd),
-  remove: (path) => rmSync(path, { force: true }),
-};
-
 const GENERATION_PENDING_FILE = "generation.pending";
 
 /** Create a complete staging file without ever truncating a colliding path. */
-export function stageFileExclusive(
-  path: string,
-  content: string,
-  operations: StagingFileOperations = STAGING_FILE_OPERATIONS,
-): string {
+function stageFileExclusive(path: string, content: string): string {
   mkdirSync(dirname(path), { recursive: true });
-  return stageAtomicFile(path, content, { mode: 0o600, operations });
+  return stageAtomicFile(path, content, { mode: 0o600 });
 }
 
 export class RunStoreOwnershipError extends Error {

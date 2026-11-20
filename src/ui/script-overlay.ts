@@ -19,7 +19,7 @@ export const OVERLAY_HEIGHT = 22;
 const HEADER_ROWS = 1;
 const FOOTER_ROWS = 1;
 
-export function bodyHeight(height: number): number {
+function bodyHeight(height: number): number {
   return Math.max(1, height - HEADER_ROWS - FOOTER_ROWS);
 }
 

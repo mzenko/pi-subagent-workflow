@@ -18,7 +18,7 @@ pi install git:github.com/mzenko/pi-subagent-workflow
 pi install /path/to/pi-subagent-workflow
 ```
 
-Registers the `subagent` and `workflow` tools, the `/agents` navigator, and the saved-workflow commands.
+Registers the `subagent`, `subagent_message`, `subagent_stop`, and `workflow` tools, the `/agents` navigator, and the saved-workflow commands.
 
 ## `subagent`
 
@@ -33,7 +33,17 @@ Spawn one child. Children start cold with only their prompt and run in the backg
 | `isolation` | `"worktree"` runs in a temp git worktree; changes return as a patch, never auto-applied. |
 | `followUp` | `{ id, prompt }` forks a completed child's session into a new run. |
 
-Concurrency across all spawns is bounded by one global semaphore (`/workflow-settings` to change). `tools`/`excludeTools` narrow the child's toolset; `subagent` and `workflow` are always excluded.
+Concurrency across all spawns is bounded by one global semaphore (`/workflow-settings` to change). `tools`/`excludeTools` narrow the child's toolset; `subagent`, `subagent_message`, `subagent_stop`, and `workflow` are always excluded.
+
+## `subagent_message`
+
+`{ id, message }` sends a message to a child this session started with `subagent` while it is still queued or running (the id, or the run id, from the spawn receipt). It reaches the child as `[Message m<n> from your parent agent]` after the child's current tool calls finish; a child still waiting to start reads it right after its task prompt. The child does not reply: its reaction shows up in its normal result.
+
+A message that lands just as the child finishes may never be read. The runner tracks each message until it is seen entering the child's conversation, and the result lists any that were not as `unconfirmedMessages` (id and short preview), with a warning in the delivery. A confirmed message entered the conversation; that does not prove the child acted on it (it may have been stopped right after). That tracking is in memory, so a parent crash loses it. Finished children, workflow children, and `/agents` follow-ups cannot be messaged; use `followUp` to continue a finished child. In a headless host the parent's turn is blocked on the child, so there is no chance to send one.
+
+## `subagent_stop`
+
+`{ id }` stops a running subagent (its id or run id) or workflow (its run id) that this session started, so the user can just ask the agent to cancel. It is the same stop as `x x` in `/agents`: a workflow's loop is cancelled and every live child aborted, and the call returns once the run has settled. The aborted result is still delivered afterwards with any partial output. A subagent that had already finished its work is left alone and reported as `already-finished`; its normal result arrives as usual. One that ignores the stop is killed after the 15s settle grace and reported as `terminated`. Other sessions' runs, individual workflow children, and `/agents` follow-ups cannot be stopped this way.
 
 ## `workflow`
 

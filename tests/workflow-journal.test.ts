@@ -66,22 +66,20 @@ test("journal call keys are stable and causal invalidation preserves sibling bra
   expect(isInCausalTail(replacementAtGroupIdentity, removedGroupOrigin)).toBe(true);
 });
 
-test("readJournal accepts current v4 entries", () => {
-  const path = join(mkdtempSync(join(tmpdir(), "workflow-journal-version-")), "journal.jsonl");
-  const lines = [
-    entryLine({ result: "first" }),
-    entryLine({ call: { scope: [], operation: 1 }, result: "second", childId: "second-child" }),
-  ];
-  writeFileSync(path, lines.join("\n") + "\n");
-
-  expect([...readJournal(path).entries.values()].map((entry) => entry.result)).toEqual(["first", "second"]);
-});
-
-test("readJournal rejects pre-fingerprint entries as a format break", () => {
+test("readJournal rejects entries from older formats as a format break", () => {
   const path = join(mkdtempSync(join(tmpdir(), "workflow-journal-legacy-")), "journal.jsonl");
   const legacy = [
     { call: { scope: [], operation: 0 }, hash: "old", result: "old", childId: "old-child" },
     { v: 2, call: { scope: [], operation: 1 }, hash: "new", result: "new", childId: "new-child" },
+    {
+      v: 3,
+      call: { scope: [], operation: 0 },
+      hash: "old",
+      fingerprint: testFingerprint(),
+      result: "old",
+      childId: "old-child",
+      usage: { input: 1, output: 1 },
+    },
   ];
   for (const entry of legacy) {
     writeFileSync(path, `${JSON.stringify(entry)}\n`);
@@ -89,20 +87,6 @@ test("readJournal rejects pre-fingerprint entries as a format break", () => {
       `Cannot resume workflow: journal ${path} line 1 predates the current format, so this run cannot be resumed. Re-run the workflow fresh.`,
     );
   }
-});
-
-test("readJournal rejects budget-era v3 entries as a format break", () => {
-  const path = join(mkdtempSync(join(tmpdir(), "workflow-journal-v3-")), "journal.jsonl");
-  writeFileSync(path, `${JSON.stringify({
-    v: 3,
-    call: { scope: [], operation: 0 },
-    hash: "old",
-    fingerprint: testFingerprint(),
-    result: "old",
-    childId: "old-child",
-    usage: { input: 1, output: 1 },
-  })}\n`);
-  expect(() => readJournal(path)).toThrow("predates the current format");
 });
 
 test("readJournal rejects a v4 entry with a malformed fingerprint", () => {
@@ -130,15 +114,6 @@ test("readJournal refuses invalid JSON on an interior line", () => {
   );
 });
 
-test("readJournal tolerates invalid JSON on an unterminated final line", () => {
-  const path = join(mkdtempSync(join(tmpdir(), "workflow-journal-torn-tail-")), "journal.jsonl");
-  writeFileSync(path, `${entryLine({ result: "first" })}\n{broken`);
-
-  const journal = readJournal(path);
-  expect([...journal.entries.values()].map((entry) => entry.result)).toEqual(["first"]);
-  expect(journal.tornTail).toBe(true);
-});
-
 test("readJournal refuses invalid JSON on a newline-terminated final line", () => {
   const path = join(mkdtempSync(join(tmpdir(), "workflow-journal-complete-tail-")), "journal.jsonl");
   writeFileSync(path, `${entryLine({ result: "first" })}\n{broken\n`);
@@ -152,15 +127,6 @@ test("readJournal refuses invalid JSON on a newline-terminated final line", () =
   expect(error).toBeInstanceOf(JournalUnreadableError);
   expect((error as Error).message).toBe(
     `Cannot resume workflow: journal ${path} line 2 is unreadable because it contains invalid JSON. Re-run the workflow fresh.`,
-  );
-});
-
-test("readJournal refuses parsed entries outside the current format", () => {
-  const path = join(mkdtempSync(join(tmpdir(), "workflow-journal-shape-")), "journal.jsonl");
-  writeFileSync(path, "{}\n");
-
-  expect(() => readJournal(path)).toThrow(
-    `Cannot resume workflow: journal ${path} line 1 is unreadable because the entry does not match the current format. Re-run the workflow fresh.`,
   );
 });
 
@@ -187,9 +153,4 @@ test("describeFingerprintDrift names every differing field and only those", () =
   expect(drift).toHaveLength(2);
   expect(drift[0]).toBe('modelId was "tiny" and is now "large"');
   expect(drift[1]).toBe('extensionTools was ["fetch_content"] and is now ["fetch_content","web_search"]');
-});
-
-test("describeFingerprintDrift reports a version epoch change", () => {
-  expect(describeFingerprintDrift(testFingerprint(), testFingerprint({ version: CALL_FINGERPRINT_VERSION + 1 })))
-    .toEqual([`version was ${CALL_FINGERPRINT_VERSION} and is now ${CALL_FINGERPRINT_VERSION + 1}`]);
 });

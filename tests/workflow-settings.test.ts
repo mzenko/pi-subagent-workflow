@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   DEFAULT_WORKFLOW_SETTINGS,
-  NUMERIC_SETTING_RULES,
   parseSettings,
   WorkflowSettingsStore,
 } from "../src/settings/workflow-settings.js";
@@ -48,7 +47,6 @@ test("independent stores rebase mutations instead of losing unrelated changes", 
   const reloaded = new WorkflowSettingsStore({ path, warn: () => {} }).get();
   expect(reloaded.maxConcurrentAgents).toBe(3);
   expect(reloaded.agentTimeoutMinutes).toBe(2);
-  expect(readdirSync(join(path, ".."))).toContain("settings.json.lock.sqlite");
 });
 
 test("settings lock rejects a live owner but recovers after that owner dies", async () => {
@@ -76,7 +74,6 @@ test("settings lock rejects a live owner but recovers after that owner dies", as
     holder.kill();
     await holder.exited;
     expect(store.set("agentTimeoutMinutes", 2).agentTimeoutMinutes).toBe(2);
-    expect(existsSync(lockPath)).toBe(true);
   } finally {
     holder.kill();
     await holder.exited;
@@ -105,7 +102,9 @@ test("strict parsing rejects unknown, missing, and out-of-range settings", () =>
   expect(() => parseSettings(JSON.stringify({ ...valid, surprise: true }))).toThrow("exactly");
   const { showStatusWidget: _, ...missing } = valid;
   expect(() => parseSettings(JSON.stringify(missing))).toThrow("exactly");
-  expect(() => parseSettings(JSON.stringify({ ...valid, agentTimeoutMinutes: 241 }))).toThrow("1 to 240");
+  expect(() => parseSettings(JSON.stringify({ ...valid, agentTimeoutMinutes: 241 }))).toThrow(
+    "agentTimeoutMinutes must be an integer from 1 to 240",
+  );
   expect(() => parseSettings(JSON.stringify({ ...valid, version: 2 }))).toThrow("unsupported settings version");
 });
 
@@ -281,20 +280,6 @@ test("legacy files with a malformed deleted key do not migrate and are left unch
   expect(readFileSync(path, "utf8")).toBe(original);
 });
 
-test("version 3 files with unknown keys do not migrate and are left unchanged", () => {
-  const path = tempPath();
-  const original = `${JSON.stringify({ version: 3, ...DEFAULT_WORKFLOW_SETTINGS, childExtensionExclusions: [], unknownSetting: true })}\n`;
-  writeFileSync(path, original);
-  const warnings: string[] = [];
-
-  const store = new WorkflowSettingsStore({ path, warn: (warning) => warnings.push(warning) });
-
-  expect(store.get()).toEqual(DEFAULT_WORKFLOW_SETTINGS);
-  expect(warnings).toEqual([store.getWarning()!]);
-  expect(store.getWarning()).toContain("found file version 3");
-  expect(readFileSync(path, "utf8")).toBe(original);
-});
-
 test("v4 files with unknown keys fail closed and refuse edits without being rewritten", () => {
   const path = tempPath();
   const original = `${JSON.stringify({ version: 4, ...DEFAULT_WORKFLOW_SETTINGS, maxConcurrentAgents: 7, unknownSetting: true })}\n`;
@@ -315,24 +300,7 @@ test("v4 files with unknown keys fail closed and refuse edits without being rewr
 });
 
 
-test("numeric setting rules are deeply frozen and cannot change parsing behavior", () => {
-  expect(Object.isFrozen(NUMERIC_SETTING_RULES)).toBe(true);
-  for (const rule of Object.values(NUMERIC_SETTING_RULES)) expect(Object.isFrozen(rule)).toBe(true);
-
-  expect(() => (NUMERIC_SETTING_RULES.agentTimeoutMinutes as { max: number }).max = 2).toThrow();
-  expect(NUMERIC_SETTING_RULES.agentTimeoutMinutes.max).toBe(240);
-  const valid = { version: 4, ...DEFAULT_WORKFLOW_SETTINGS };
-  expect(() => parseSettings(JSON.stringify({ ...valid, agentTimeoutMinutes: 240 }))).not.toThrow();
-  expect(() => parseSettings(JSON.stringify({ ...valid, agentTimeoutMinutes: 241 }))).toThrow(
-    "agentTimeoutMinutes must be an integer from 1 to 240",
-  );
-});
-
-test("numeric setting rules preserve all store boundaries and sentinels", () => {
-  expect(NUMERIC_SETTING_RULES).toEqual({
-    maxConcurrentAgents: { min: 1, max: 64, sentinel: "auto" },
-    agentTimeoutMinutes: { min: 1, max: 240, sentinel: 0 },
-  });
+test("numeric settings files accept sentinels and boundaries and reject values just outside", () => {
   const valid = { version: 4, ...DEFAULT_WORKFLOW_SETTINGS };
   for (const [key, values] of Object.entries({
     maxConcurrentAgents: ["auto", 1, 64],

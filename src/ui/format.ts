@@ -32,7 +32,7 @@ export function spinnerFrame(now: number): string {
 }
 
 /** Theme color role for each terminal/active status. */
-export function statusColor(status: SubagentStatus): string {
+function statusColor(status: SubagentStatus): string {
   switch (status) {
     case "completed":
       return "success";

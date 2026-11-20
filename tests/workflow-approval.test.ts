@@ -55,8 +55,6 @@ test("approval summary lists name and phases", () => {
   const summary = buildApprovalSummary(plan("saved"));
   expect(summary).toContain("Launch workflow: audit-routes");
   expect(summary).toContain("Phases: Discover -> Audit");
-  expect(summary).not.toContain("Agent calls");
-  expect(summary).not.toContain("Budget");
 });
 
 test("approval summary strips terminal controls from workflow metadata", () => {

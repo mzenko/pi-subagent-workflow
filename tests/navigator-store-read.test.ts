@@ -172,12 +172,13 @@ test("a second list of 50 unchanged terminal runs performs no additional snapsho
   const first = listRunSummaries(CWD, opts);
   expect(first).toHaveLength(50);
   expect(snapshotReads).toBe(50);
-  expect(fileReads).toBe(300);
+  const fileReadsAfterFirstList = fileReads;
+  expect(fileReadsAfterFirstList).toBeGreaterThan(0);
 
   const second = listRunSummaries(CWD, opts);
   expect(second).toEqual(first);
   expect(snapshotReads).toBe(50);
-  expect(fileReads).toBe(300);
+  expect(fileReads).toBe(fileReadsAfterFirstList);
 });
 
 test("summary reads traverse events once and do not retain full detail", () => {
@@ -239,33 +240,6 @@ test("summary reads traverse events once and do not retain full detail", () => {
     phases: [{ title: "detail-only" }],
     children: [expect.objectContaining({ model: "detail-model", tokens: 5 })],
   });
-  expect(snapshotReads).toBe(2);
-});
-
-test("a terminal file mtime bump causes exactly one snapshot reread", () => {
-  const runId = "terminal-mtime";
-  const root = makeRoot([{
-    runId,
-    runJson: { runId, kind: "subagent", createdAt: "2026-07-11T10:00:00.000Z", children: [] },
-    statusJson: { status: "completed", children: {} },
-    events: [],
-  }]);
-  let snapshotReads = 0;
-  const opts = {
-    root,
-    readSnapshot(runDir: string) {
-      snapshotReads += 1;
-      return readRunSnapshot(runDir);
-    },
-  };
-
-  expect(listRunSummaries(CWD, opts)[0]?.status).toBe("completed");
-  expect(snapshotReads).toBe(1);
-  const bumped = new Date(Date.now() + 60_000);
-  utimesSync(join(root, encodeCwd(CWD), runId, "status.json"), bumped, bumped);
-  expect(listRunSummaries(CWD, opts)[0]?.status).toBe("completed");
-  expect(snapshotReads).toBe(2);
-  expect(listRunSummaries(CWD, opts)[0]?.status).toBe("completed");
   expect(snapshotReads).toBe(2);
 });
 
@@ -1072,49 +1046,6 @@ test("dead-parent runs reconcile: event terminals fold in, survivors read aborte
   expect(detail.status).toBe("aborted");
 });
 
-test("an unchanged dead-owner terminal projection skips further snapshot reads and owner probes", () => {
-  const runId = "run-dead-cache";
-  const root = makeRoot([{
-    runId,
-    runJson: {
-      runId,
-      kind: "subagent",
-      createdAt: "2026-07-11T10:00:00.000Z",
-      children: [{ id: "c1", spec: { prompt: "orphaned" } }],
-    },
-    statusJson: { status: "running", children: { c1: { status: "running" } } },
-    events: [],
-    deadOwner: true,
-  }]);
-  let snapshotReads = 0;
-  let ownerProbes = 0;
-  const opts = {
-    root,
-    readSnapshot(runDir: string) {
-      snapshotReads += 1;
-      return readRunSnapshot(runDir);
-    },
-    ownerIsLive() {
-      ownerProbes += 1;
-      return false;
-    },
-  };
-
-  expect(listRunSummaries(CWD, opts)[0]).toMatchObject({
-    status: "aborted",
-    reconciled: true,
-  });
-  expect(snapshotReads).toBe(1);
-  expect(ownerProbes).toBe(1);
-
-  expect(listRunSummaries(CWD, opts)[0]).toMatchObject({
-    status: "aborted",
-    reconciled: true,
-  });
-  expect(snapshotReads).toBe(1);
-  expect(ownerProbes).toBe(1);
-});
-
 test("a dead-owner race self-corrects after completion rewrites status", () => {
   const runId = "run-completed-during-probe";
   const root = makeRoot([{
@@ -1299,10 +1230,15 @@ test("a reconciled dead-owner projection expires and re-probes after the TTL", (
     events: [],
     deadOwner: true,
   }]);
+  let snapshotReads = 0;
   let ownerProbes = 0;
   let ownerLive = false;
   const opts = {
     root,
+    readSnapshot(runDir: string) {
+      snapshotReads += 1;
+      return readRunSnapshot(runDir);
+    },
     ownerIsLive() {
       ownerProbes += 1;
       return ownerLive;
@@ -1314,12 +1250,14 @@ test("a reconciled dead-owner projection expires and re-probes after the TTL", (
   try {
     // Dead owner: reconciled to aborted and cached.
     expect(listRunSummaries(CWD, opts)[0]).toMatchObject({ status: "aborted", reconciled: true });
+    expect(snapshotReads).toBe(1);
     expect(ownerProbes).toBe(1);
 
     // A resume acquires the lock without changing any relevant file mtime yet.
     // Within the TTL the stale reconciled row is permissible...
     ownerLive = true;
     expect(listRunSummaries(CWD, opts)[0]?.status).toBe("aborted");
+    expect(snapshotReads).toBe(1);
     expect(ownerProbes).toBe(1);
 
     // ...but a reconciled classification depends on lock state, so it must

@@ -12,7 +12,7 @@ import { childLabel } from "../../util.js";
 import { missingExplicitTools, resolveModel, SUBAGENT_FRAMING, type ConstructedChild, type ParentContext } from "../child.js";
 import type { SchemaCapture } from "../schema-tool.js";
 import type { SubagentSpec } from "../../types.js";
-import { buildChildArgs } from "./child-args.js";
+import { buildChildArgs, RECURSION_GUARD_TOOLS } from "./child-args.js";
 import { RpcChildSession } from "./rpc-child-session.js";
 import { spawnChildRpc, type ChildRpc } from "./rpc-transport.js";
 import { readToolReport, SHIM_SPEC_ENV, type ShimToolReport } from "./shim-contract.js";
@@ -166,7 +166,7 @@ export async function spawnSubprocessChild(
     // but if a report still lists them (extension installed under a name the
     // exclusion missed) refuse the spawn rather than allow child trees to
     // recurse. Mirrors the in-process activeTools assertion.
-    const guardBreach = report.activeTools.filter((name) => name === "subagent" || name === "workflow");
+    const guardBreach = report.activeTools.filter((name) => RECURSION_GUARD_TOOLS.includes(name));
     if (guardBreach.length > 0) {
       throw new Error(`Recursion guard: child still exposes ${guardBreach.join(", ")} despite the exclusion.`);
     }
@@ -217,12 +217,15 @@ function wireSchemaCapture(session: RpcChildSession, capture: SchemaCapture): vo
   interface Candidate { id: string; value: unknown }
   const calls = new Map<string, CallState>();
   let candidate: Candidate | undefined;
+  /** report_result succeeded and the turn was asked to end. */
+  let terminationRequested = false;
   let published = false;
   let attemptPoisoned = false;
   let activeAttempt: number | undefined;
   const clearAttempt = (): void => {
     calls.clear();
     candidate = undefined;
+    terminationRequested = false;
   };
   const poisonAttempt = (): void => {
     attemptPoisoned = true;
@@ -263,6 +266,13 @@ function wireSchemaCapture(session: RpcChildSession, capture: SchemaCapture): vo
       return;
     }
     const event = attemptEvent.event;
+    // pi's abort keeps queued steers and continues the session on them, so a
+    // message queued as report_result lands would start a fresh run that can
+    // call tools and poison the capture. End that run too.
+    if (event.type === "agent_start" && terminationRequested) {
+      capture.terminate?.();
+      return;
+    }
     if (event.type !== "tool_execution_start" && event.type !== "tool_execution_end") return;
     const existing = calls.get(event.toolCallId);
     if (event.type === "tool_execution_start") {
@@ -281,6 +291,7 @@ function wireSchemaCapture(session: RpcChildSession, capture: SchemaCapture): vo
       return;
     }
     candidate = { id: event.toolCallId, value: existing.args };
+    terminationRequested = true;
     capture.terminate?.();
   });
 }

@@ -1,2 +1,8 @@
 [test]
 preload = "./tests/preload-agent-dir.ts"
+
+[install]
+# Supply-chain cooldown: refuse package versions published less than 7 days
+# ago, so a hijacked release has time to be caught and pulled before it can
+# land here.
+minimumReleaseAge = 604800

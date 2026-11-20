@@ -35,7 +35,7 @@ describe("buildChildArgs", () => {
       "--thinking", "high",
       "--session-dir", "/runs/r1/sessions",
       "--append-system-prompt", "You are a subagent.",
-      "--exclude-tools", "subagent,workflow",
+      "--exclude-tools", "subagent,workflow,subagent_message,subagent_stop",
       "--tools", "read,bash",
       "--extension", "/pkg/dist/child-shim.js",
     ]);
@@ -44,15 +44,8 @@ describe("buildChildArgs", () => {
   test("always excludes the recursion-guard tools, merged with requested exclusions", () => {
     const args = buildChildArgs({ ...base, excludeTools: ["todo", "subagent"] });
     const excludeIndex = args.indexOf("--exclude-tools");
-    expect(args[excludeIndex + 1]).toBe("todo,subagent,workflow");
+    expect(args[excludeIndex + 1]).toBe("todo,subagent,workflow,subagent_message,subagent_stop");
     expect(args).not.toContain("--tools");
-  });
-
-  test("maps a persisted session file to the fork flag", () => {
-    const args = buildChildArgs({ ...base, forkSessionFile: "/runs/source/sessions/original.jsonl" });
-    const forkIndex = args.indexOf("--fork");
-    expect(forkIndex).toBeGreaterThan(-1);
-    expect(args[forkIndex + 1]).toBe("/runs/source/sessions/original.jsonl");
   });
 
   test("an explicit empty allowlist crosses as --tools '' (zero tools), not as no flag", () => {
@@ -133,13 +126,6 @@ const assistant = (text: string, input = 0, output = 0): AssistantMessage => ({
 } as unknown as AssistantMessage);
 
 describe("RpcChildSession", () => {
-  test("start captures the child session file from get_state", async () => {
-    const rpc = fakeRpc();
-    rpc.respond("get_state", { isStreaming: false, isCompacting: false, pendingMessageCount: 0, sessionFile: "/sessions/child.jsonl" });
-    const session = await RpcChildSession.start(rpc);
-    expect(session.sessionFile).toBe("/sessions/child.jsonl");
-  });
-
   test("startup lifecycle frames cannot contaminate the first prompt", async () => {
     const rpc = fakeRpc();
     const stale = assistant("stale", 7, 9);
@@ -204,29 +190,6 @@ describe("RpcChildSession", () => {
     expect(secondResolved).toBe(true);
   });
 
-  test("custom message lifecycle events do not let a stale settlement complete a pending prompt", async () => {
-    const rpc = fakeRpc();
-    rpc.respond("get_state", { isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
-    const session = await RpcChildSession.start(rpc);
-    rpc.respond("prompt", undefined);
-    let resolved = false;
-    const turn = session.prompt("pending prompt").then(() => { resolved = true; });
-    await Bun.sleep(0);
-
-    const custom = { role: "custom", customType: "notice", content: "outside an agent run" };
-    rpc.emit({ type: "message_start", message: custom });
-    rpc.emit({ type: "message_update", message: custom, assistantMessageEvent: { type: "citation_delta" } });
-    rpc.emit({ type: "message_end", message: custom });
-    rpc.emit({ type: "agent_settled" });
-    await Bun.sleep(0);
-    expect(resolved).toBe(false);
-
-    rpc.emit({ type: "agent_start" });
-    rpc.emit({ type: "agent_settled" });
-    await turn;
-    expect(resolved).toBe(true);
-  });
-
   test("run activity accepts guarded prompts without agent_start", async () => {
     const rpc = fakeRpc();
     // Idle only for the startup handshake; every later get_state reports
@@ -279,6 +242,7 @@ describe("RpcChildSession", () => {
     // a stale agent_settled must not settle the pending turn.
     const custom = { role: "custom", content: "outside a run" };
     rpc.emit({ type: "message_start", message: custom });
+    rpc.emit({ type: "message_update", message: custom, assistantMessageEvent: { type: "citation_delta" } });
     rpc.emit({ type: "message_end", message: custom });
     rpc.emit({ type: "agent_settled" });
     let settled = false;
@@ -337,6 +301,27 @@ describe("RpcChildSession", () => {
     await expect(session.prompt("stuck")).rejects.toThrow(/neither started an agent run nor settled/);
   }, 20_000);
 
+  test("our own unread steer does not keep an immediately handled prompt from completing", async () => {
+    const rpc = fakeRpc();
+    rpc.respond("steer", undefined);
+    rpc.respond("prompt", undefined);
+    rpc.respond("get_state", { isStreaming: false, isCompacting: false, pendingMessageCount: 1 });
+    const session = new RpcChildSession(rpc, { sessionFile: undefined });
+    await session.steer("[Message m1 from your parent agent]\nnote");
+    await session.prompt("/probe");
+  }, 20_000);
+
+  test("a steer that entered the conversation no longer discounts pending work", async () => {
+    const rpc = fakeRpc();
+    rpc.respond("steer", undefined);
+    rpc.respond("prompt", undefined);
+    rpc.respond("get_state", { isStreaming: false, isCompacting: false, pendingMessageCount: 1 });
+    const session = new RpcChildSession(rpc, { sessionFile: undefined });
+    await session.steer("seen");
+    rpc.emit({ type: "message_start", message: { role: "user", content: [{ type: "text", text: "seen" }] } });
+    await expect(session.prompt("stuck")).rejects.toThrow(/neither started an agent run nor settled/);
+  }, 20_000);
+
   test("transient compaction does not stand down or exhaust the immediate-completion poller", async () => {
     const rpc = fakeRpc();
     rpc.respond("prompt", undefined);
@@ -370,7 +355,6 @@ describe("RpcChildSession", () => {
 
     expect(session.latestAssistant).toEqual(assistant("billed-but-turn-never-ended", 5, 6));
     expect(session.usage).toEqual({ input: 8, output: 10, cacheRead: 2, cacheWrite: 4, cost: 0.02, turns: 2 });
-    expect("messages" in session).toBe(false);
   });
 
   test("forwards streaming events and clears currentAssistant only at settlement", () => {
@@ -442,6 +426,14 @@ describe("RpcChildSession", () => {
     rpc.exit({ code: 0, signal: null });
     await session.abort();
     expect(rpc.sent).toHaveLength(2);
+  });
+
+  test("steer on a dead child fails at once instead of waiting out the control timeout", async () => {
+    const rpc = fakeRpc();
+    const session = new RpcChildSession(rpc, { sessionFile: undefined });
+    rpc.exit({ code: 1, signal: null });
+    await expect(session.steer("too late")).rejects.toThrow("exited before settling");
+    expect(rpc.sent).toEqual([]);
   });
 
   test("dispose sends SIGTERM and resolves only once the process has exited", async () => {

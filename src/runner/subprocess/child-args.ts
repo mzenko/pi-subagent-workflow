@@ -24,8 +24,10 @@ export interface ChildProcessConfig {
   shimPath?: string;
 }
 
-/** Tools children must never expose: the recursion guard, now per-process. */
-const RECURSION_GUARD_TOOLS = ["subagent", "workflow"];
+/** Tools children must never expose: the recursion guard, now per-process.
+ * subagent_message and subagent_stop are parent-only too; a child has no
+ * children to address. */
+export const RECURSION_GUARD_TOOLS = ["subagent", "workflow", "subagent_message", "subagent_stop"];
 
 export function buildChildArgs(config: ChildProcessConfig): string[] {
   for (const name of [...(config.tools ?? []), ...(config.excludeTools ?? [])]) {

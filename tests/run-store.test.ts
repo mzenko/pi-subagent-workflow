@@ -1,9 +1,9 @@
 import { expect, spyOn, test } from "bun:test";
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { OWNER_FILE, runOwnerIsLive } from "../src/store/lease.js";
-import { encodeCwd, GenerationPendingError, RunStore, RunStoreOwnershipError, stageFileExclusive } from "../src/store/run-store.js";
+import { encodeCwd, GenerationPendingError, RunStore, RunStoreOwnershipError } from "../src/store/run-store.js";
 import { readJournal } from "../src/workflow/journal.js";
 
 interface RunStoreFileInternals {
@@ -57,11 +57,9 @@ test("run store creates its layout and appends events", () => {
   const store = new RunStore("run-1", "/work/example", "parent-1", "/parent.jsonl", { rootDir });
   store.addChild("child-1", { prompt: "test" });
   store.recordEvent({ type: "status", id: "child-1", status: "running" });
-  expect(readdirSync(store.runDir).sort()).toEqual([
+  expect(readdirSync(store.runDir).filter((name) => !name.startsWith("owner.sqlite")).sort()).toEqual([
     "events.jsonl",
     "owner.json",
-    "owner.sqlite",
-    "owner.sqlite-journal",
     "run.json",
     "sessions",
     "status.json",
@@ -448,7 +446,7 @@ test("successful generation commits remove the marker and allow later resumes", 
   resumed.startWorkflowGeneration("new script", [{ title: "New" }], {}, { requireExistingScript: true });
   expect(resumed.deliveryIdentity?.generation).toBe(2);
   expect(existsSync(join(first.runDir, "generation.pending"))).toBe(false);
-  expect((resumed as unknown as { openedSnapshot?: unknown }).openedSnapshot).toBeUndefined();
+  expect(resumed.resumeSnapshot).toBeUndefined();
   resumed.workflowFinished("completed");
 
   const resumedAgain = new RunStore(runId, "/work/example", "parent-3", undefined, {
@@ -519,44 +517,6 @@ test("status replacement is atomic and leaves no temporary file", () => {
   const status = JSON.parse(readFileSync(join(store.runDir, "status.json"), "utf8"));
   expect(status.status).toBe("completed");
   expect(readdirSync(store.runDir).some((name) => name.startsWith("status.json.tmp-"))).toBe(false);
-});
-
-test("a partial staging write preserves its error and leaves no temporary file", () => {
-  const directory = temporaryRoot();
-  const path = join(directory, "journal.jsonl");
-  const primary = new Error("injected partial write");
-  let flags: string | undefined;
-  let attempted = false;
-  let caught: unknown;
-
-  try {
-    stageFileExclusive(path, "complete journal contents", {
-      open: (temporary, openFlags, mode) => {
-        flags = openFlags;
-        return openSync(temporary, openFlags, mode);
-      },
-      write: (fd, buffer, offset, length) => {
-        if (attempted) return writeSync(fd, buffer, offset, length);
-        attempted = true;
-        writeSync(fd, buffer, offset, Math.max(1, Math.floor(length / 2)));
-        throw primary;
-      },
-      close: (fd) => {
-        closeSync(fd);
-        throw new Error("injected close failure");
-      },
-      remove: (temporary) => {
-        rmSync(temporary, { force: true });
-        throw new Error("injected cleanup failure");
-      },
-    });
-  } catch (error) {
-    caught = error;
-  }
-
-  expect(caught).toBe(primary);
-  expect(flags).toBe("wx");
-  expect(readdirSync(directory).filter((name) => name.startsWith("journal.jsonl.tmp-"))).toEqual([]);
 });
 
 test("cwd encoding is readable and injective across paths that share a slug", () => {
@@ -708,11 +668,9 @@ test("workflow runs stay running between children and ignore pending events afte
 
   const closedStatus = readFileSync(statusPath, "utf8");
   const closedEvents = readFileSync(eventsPath, "utf8");
-  const closedMemory = JSON.stringify((store as unknown as { status: unknown }).status);
   store.recordEvent({ type: "status", id: "c1", status: "pending" });
   expect(readFileSync(statusPath, "utf8")).toBe(closedStatus);
   expect(readFileSync(eventsPath, "utf8")).toBe(closedEvents);
-  expect(JSON.stringify((store as unknown as { status: unknown }).status)).toBe(closedMemory);
   expect(existsSync(ownerPath)).toBe(false);
 });
 

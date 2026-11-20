@@ -201,6 +201,29 @@ describe("spawnSubprocessChild", () => {
     expect(child.schemaCapture?.value).toEqual({ answer: 42 });
   });
 
+  test("re-aborts a schema child that restarts on a queued message after report_result", async () => {
+    const runDir = tempDir();
+    const controls = fakeSpawn({});
+    const spec: SubagentSpec = { prompt: "report", schema: { type: "object" } };
+    const child = await spawnSubprocessChild(spec, fakeParent(runDir), { sessionsDir: join(runDir, "sessions") }, spawnFor(controls));
+
+    const prompt = child.session.prompt("report");
+    await Bun.sleep(0);
+    controls.emit({ type: "agent_start" });
+    controls.emit({ type: "tool_execution_start", toolCallId: "c1", toolName: "report_result", args: { answer: 42 } });
+    controls.emit({ type: "tool_execution_end", toolCallId: "c1", toolName: "report_result", result: "ok", isError: false });
+    const abortsAfterReport = controls.sent.filter((command) => (command as { type?: string }).type === "abort").length;
+    // pi continues on the queued steer: a fresh run starts in the same attempt.
+    controls.emit({ type: "agent_start" });
+    await Bun.sleep(0);
+    expect(controls.sent.filter((command) => (command as { type?: string }).type === "abort").length).toBe(abortsAfterReport + 1);
+    controls.emit({ type: "agent_settled" });
+    await prompt;
+
+    expect(child.schemaCapture?.called).toBe(true);
+    expect(child.schemaCapture?.value).toEqual({ answer: 42 });
+  });
+
   test("ignores failed report_result executions", async () => {
     const runDir = tempDir();
     const controls = fakeSpawn({});

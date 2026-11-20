@@ -1,23 +1,53 @@
 /**
- * Blank inline-image lines in the visible viewport while an overlay is mounted.
+ * Blank on-screen inline-image lines while one of our overlays is mounted.
  *
- * pi-tui composites overlays over text lines but deliberately skips image
- * lines (compositeLineAt returns the base line untouched when it carries an
- * image escape), and kitty graphics placements default to z=0, which draws
- * above text - so an inline image under the /agents panel always paints over
- * it, and pi-tui re-transmits the placement on every panel repaint. Upstream
- * declined to blank covered image blocks in compositeOverlays (pi issue
- * #6995), so while an overlay of ours is up this installs a render wrapper on
- * the live renderer that blanks viewport image lines: pi-tui's own
- * differential pass then deletes the kitty placement, the overlay composites
- * normally, and unmounting re-transmits the image the same way.
+ * Why images paint over overlays: pi-tui composites overlays over text lines
+ * but deliberately skips image lines (compositeTuiLine returns the base line
+ * untouched when it carries an image escape). Kitty graphics placements live
+ * on a layer above text (z=0 by default), so Kitty and Ghostty keep drawing
+ * the image over any text written into its cells; terminals that store images
+ * in cells (WezTerm, Orca) are no better, because pi's fullscreen renderer
+ * draws image placements after all text. iTerm2's protocol is cell-based, but
+ * the uncomposited anchor row still punches a hole through the panel. Every
+ * terminal pi sends images to (Kitty, Ghostty, WezTerm, Warp, Orca, iTerm2)
+ * is affected; terminals pi does not send images to (tmux, Alacritty, VS
+ * Code, Terminal.app, ...) never see it. Upstream declined to blank covered
+ * image blocks itself (pi issue #6995).
+ *
+ * The seam is TUI.compositeOverlays(lines, termWidth, termHeight). Both pi
+ * renderers call it with the frame's lines just before their differential
+ * pass: the regular (main-screen) renderer with the whole buffer, the
+ * fullscreen (alt-screen, the default since pi 1.0) renderer with the screen.
+ * Patching TUI.render instead - the previous approach - only ever worked in
+ * regular mode: fullscreen builds its frame through a layout root and never
+ * calls render, which is why images kept covering /agents there. Blanking an
+ * anchor line makes pi's own pass delete the placement (per-image deletes in
+ * regular mode, delete-all-placements plus redraw in fullscreen); unmounting
+ * restores the line and pi re-places the image the same way.
+ *
+ * Which lines are blanked:
+ * - Every image line in the visible viewport (the last termHeight lines; the
+ *   whole frame in fullscreen). Extensions cannot see overlay geometry, and
+ *   the panel covers ~90% of the screen anyway.
+ * - In regular mode, a Kitty image whose anchor row scrolled above the
+ *   viewport but whose rows reach down under the panel. Its placement would
+ *   cover the panel. Blanking a line above the viewport sends pi-tui down a
+ *   scrollback-rewriting full redraw, but compositing the panel over that
+ *   image's reserved rows already forces exactly that redraw (pi-tui widens
+ *   any change touching an image block to the block's anchor), so this costs
+ *   nothing extra. The panel's top row is read off the composited frame (the
+ *   first viewport row the overlay changed), so an image that only reaches
+ *   the margin above the panel - where the panel causes no redraw - is left
+ *   alone, as are images wholly above the viewport and iTerm2 anchors (their
+ *   reserved rows are not widened, and cell-based images are overwritten by
+ *   the panel text anyway).
  *
  * The `tui` handed to ctx.ui.custom factories is not necessarily the renderer
  * itself. Since pi 0.84 it is a stable Proxy (createInteractiveTuiReference)
  * whose property reads return fresh forwarding closures that re-resolve the
- * CURRENT method at call time - so capturing `tui.render` and calling it from
- * a wrapper assigned back onto `tui` recurses into the wrapper itself, and
- * the proxy has no deleteProperty/getOwnPropertyDescriptor traps, so `delete`
+ * CURRENT method at call time - so capturing a method and calling it from a
+ * wrapper assigned back onto `tui` recurses into the wrapper itself, and the
+ * proxy has no deleteProperty/getOwnPropertyDescriptor traps, so `delete`
  * and Object.hasOwn silently miss the real renderer. Both are avoided by
  * construction here:
  * - The original is taken from the PROTOTYPE CHAIN (the proxy forwards
@@ -29,25 +59,10 @@
  *   the proxy; an own property equal to the prototype method is inert), so
  *   repeated open/close cycles never stack wrappers.
  *
- * Three deliberate scope limits:
- * - Viewport only: blanking an image line above the viewport moves
- *   firstChanged above prevViewportTop, which sends pi-tui down its
- *   fullRender(true) path - a screen clear that erases the terminal's
- *   scrollback. A multi-row image straddling the viewport top therefore keeps
- *   its placement; the panel's one-row margin keeps that off the panel itself.
- * - ALL viewport images are blanked, not only rows the panel covers:
- *   extensions cannot see overlay geometry, and the panel covers ~90% of the
- *   screen anyway.
- * - Not in fullscreen (TuiAltScreen, pi 0.84 tui-mode setting): its render
- *   loop draws through a layout root rather than this.render, so a wrapper
- *   here would never be invoked. The image-over-panel bug does exist there;
- *   fixing it would mean patching a different seam with its own hazards, for
- *   a non-default mode. Suppression no-ops instead of pretending.
- *
  * Delete this file once pi-tui blanks covered image blocks itself.
  */
 
-import type { TUI } from "@earendil-works/pi-tui";
+import { visibleWidth, type TUI } from "@earendil-works/pi-tui";
 
 // pi-tui does not export its isImageLine; these are the two escape prefixes
 // it recognizes (kitty APC and iTerm2 OSC 1337 inline files). The ESC byte is
@@ -55,61 +70,167 @@ import type { TUI } from "@earendil-works/pi-tui";
 const ESC = String.fromCharCode(0x1b);
 const KITTY = `${ESC}_G`;
 const ITERM2 = `${ESC}]1337;File=`;
+/** Bound on the upward search for an image anchored above the viewport. */
+const MAX_IMAGE_ROWS = 200;
 
-type Render = (width: number) => string[];
+type Composite = (lines: string[], termWidth: number, termHeight: number) => string[];
 
-/** The class render method, found by walking the (proxy-forwarded) prototype chain. */
-function prototypeRender(tui: TUI): Render | undefined {
+/** The class method, found by walking the (proxy-forwarded) prototype chain. */
+function prototypeComposite(tui: TUI): Composite | undefined {
   for (let proto = Object.getPrototypeOf(tui); proto; proto = Object.getPrototypeOf(proto)) {
-    const descriptor = Object.getOwnPropertyDescriptor(proto, "render");
-    if (typeof descriptor?.value === "function") return descriptor.value as Render;
+    const descriptor = Object.getOwnPropertyDescriptor(proto, "compositeOverlays");
+    if (typeof descriptor?.value === "function") return descriptor.value as Composite;
   }
   return undefined;
 }
 
+function isImageLine(line: string): boolean {
+  return line.includes(KITTY) || line.includes(ITERM2);
+}
+
+/** Rows a Kitty placement declares (`r=`), when it declares them. */
+function kittyRows(line: string): number | undefined {
+  const controls = line.slice(line.indexOf(KITTY) + KITTY.length).split(";", 1)[0] ?? "";
+  const value = /(?:^|,)r=(\d+)(?:,|$)/.exec(controls)?.[1];
+  const rows = value === undefined ? NaN : Number.parseInt(value, 10);
+  return rows > 0 ? rows : undefined;
+}
+
+/** Copy of `lines` with every image line in the visible viewport blanked. */
+export function blankViewportImageLines(lines: readonly string[], termHeight: number): string[] {
+  const result = [...lines];
+  for (let index = Math.max(0, result.length - termHeight); index < result.length; index += 1) {
+    if (isImageLine(result[index]!)) result[index] = "";
+  }
+  return result;
+}
+
+/**
+ * After compositing: blank a Kitty anchor above the viewport whose rows reach
+ * down under the panel. `input` is the frame handed to the compositor,
+ * `composited` what it returned (padded to at least termHeight). Compositing
+ * never touches lines above the viewport, so blanking one here is the same as
+ * having blanked it beforehand.
+ */
+export function blankImageAnchorsAbovePanel(input: readonly string[], composited: string[], termHeight: number): string[] {
+  const viewportStart = Math.max(0, composited.length - termHeight);
+  if (viewportStart === 0) return composited;
+  // The panel's top row is the first viewport row the compositor changed.
+  const panelTop = composited.findIndex((line, index) => index >= viewportStart && line !== (input[index] ?? ""));
+  const anchor = kittyAnchorAbove(composited, viewportStart);
+  if (panelTop === -1 || anchor === -1 || imageBlockEnd(input, anchor) < panelTop) return composited;
+  const result = [...composited];
+  result[anchor] = "";
+  return result;
+}
+
+/**
+ * The Kitty anchor just above the viewport whose blank reserved rows run down
+ * to it, or -1. Visible text or an iTerm2 image in between ends the search.
+ */
+function kittyAnchorAbove(lines: readonly string[], viewportStart: number): number {
+  for (let index = viewportStart - 1; index >= Math.max(0, viewportStart - MAX_IMAGE_ROWS); index -= 1) {
+    const line = lines[index]!;
+    if (line.includes(KITTY)) return index;
+    if (line.includes(ITERM2) || visibleWidth(line) > 0) return -1;
+  }
+  return -1;
+}
+
+/**
+ * Last row an image block covers, measured as pi-tui measures reserved rows:
+ * its declared rows, cut short by the first visible text or image below it.
+ */
+function imageBlockEnd(lines: readonly string[], anchor: number): number {
+  const last = anchor + (kittyRows(lines[anchor]!) ?? MAX_IMAGE_ROWS) - 1;
+  for (let row = anchor + 1; row <= last && row < lines.length; row += 1) {
+    const line = lines[row] ?? "";
+    if (isImageLine(line) || visibleWidth(line) > 0) return row - 1;
+  }
+  return last;
+}
+
 interface PatchEntry {
   depth: number;
-  original: Render;
+  original: Composite;
+  /** Kitty image ids this patch has hidden, to re-upload on restore. */
+  hidden: Set<string>;
+}
+
+/** The Kitty image id (`i=`) of an image line, if any. */
+function kittyImageId(line: string): string | undefined {
+  const controls = line.slice(line.indexOf(KITTY) + KITTY.length).split(";", 1)[0] ?? "";
+  return /(?:^|,)i=(\d+)(?:,|$)/.exec(controls)?.[1];
+}
+
+/**
+ * Make pi upload hidden images again instead of only re-placing them. pi's
+ * fullscreen renderer remembers which images the terminal holds and, for
+ * those, sends a bare placement. kitty discards image data left without a
+ * placement (observed in kitty 0.50; Ghostty keeps it), so after the panel
+ * closes that bare placement would draw nothing. Forgetting the upload makes
+ * the next frame send the image data with its placement.
+ */
+function forgetUploads(tui: TUI, ids: ReadonlySet<string>): void {
+  const uploaded = (tui as unknown as { uploadedKittyImages?: unknown }).uploadedKittyImages;
+  if (!(uploaded instanceof Map)) return;
+  for (const id of ids) uploaded.delete(Number(id));
 }
 
 const patched = new WeakMap<TUI, PatchEntry>();
 
 /**
- * Suppress viewport image lines until the returned disposer runs. Refcounted,
+ * Suppress covering image lines until the returned disposer runs. Refcounted,
  * so nested or overlapping overlays share one patch.
  */
 export function suppressInlineImages(tui: TUI): () => void {
-  // Fullscreen never dispatches through this.render (see scope limits above);
-  // installing a wrapper there would be inert, so do not.
-  if ((tui as { mode?: unknown }).mode === "fullscreen") return () => {};
   let entry = patched.get(tui);
   if (!entry) {
-    const original = prototypeRender(tui);
-    // Best-effort mitigation of a cosmetic bug: a host whose render is not an
-    // ordinary prototype method (test fakes, future pi-tui shapes) just keeps
-    // its images.
+    const original = prototypeComposite(tui);
+    // Best-effort mitigation of a cosmetic bug: a host without an ordinary
+    // prototype compositeOverlays (test fakes, future pi-tui shapes) just
+    // keeps its images.
     if (!original) return () => {};
-    entry = { depth: 0, original };
+    entry = { depth: 0, original, hidden: new Set() };
+    const hidden = entry.hidden;
     patched.set(tui, entry);
-    (tui as { render: Render }).render = function (this: TUI, width: number): string[] {
-      const lines = original.call(this, width);
+    (tui as unknown as { compositeOverlays: Composite }).compositeOverlays = function (
+      this: TUI, lines: string[], termWidth: number, termHeight: number,
+    ): string[] {
+      // Self-heal: pi's own teardown paths (e.g. /reload) hide overlays
+      // without running component dispose, which would leave this wrapper
+      // active forever. With no overlay mounted there is nothing to protect,
+      // so pass through untouched - after making pi re-send what was hidden,
+      // since the disposer that would have done it may never run.
+      let active = false;
+      let input = lines;
       try {
-        // Self-heal: pi's own teardown paths (e.g. /reload) hide overlays
-        // without running component dispose, which would leave this wrapper
-        // active forever. With no overlay mounted there is nothing to
-        // protect, so pass through untouched.
-        if (typeof this.hasOverlay === "function" && !this.hasOverlay()) return lines;
-        const start = Math.max(0, lines.length - (this.terminal?.rows ?? 24));
-        for (let index = start; index < lines.length; index += 1) {
-          const line = lines[index]!;
-          if (line.includes(KITTY) || line.includes(ITERM2)) lines[index] = "";
+        active = typeof this.hasOverlay !== "function" || this.hasOverlay();
+        if (active) input = blankViewportImageLines(lines, termHeight);
+        else if (hidden.size > 0) {
+          forgetUploads(this, hidden);
+          hidden.clear();
         }
       } catch {
         // This runs inside pi's render loop, where a throw kills the process.
-        // No cosmetic touch-up is worth that; fall through with whatever the
-        // real render produced.
+        // No cosmetic touch-up is worth that; composite the frame unchanged.
+        active = false;
+        input = lines;
       }
-      return lines;
+      const composited = original.call(this, input, termWidth, termHeight);
+      if (!active) return composited;
+      try {
+        const output = blankImageAnchorsAbovePanel(input, composited, termHeight);
+        // Blanked before compositing (viewport) or after (anchor above it).
+        lines.forEach((line, index) => {
+          if (!line.includes(KITTY) || (input[index] === line && output[index] === line)) return;
+          const id = kittyImageId(line);
+          if (id !== undefined) hidden.add(id);
+        });
+        return output;
+      } catch {
+        return composited;
+      }
     };
   }
   entry.depth += 1;
@@ -124,10 +245,14 @@ export function suppressInlineImages(tui: TUI): () => void {
     // Assignment, not delete: pi's TUI reference proxy forwards set but has
     // no deleteProperty trap. An own property holding the prototype method is
     // behaviorally identical to no own property at all.
-    (tui as { render: Render }).render = current.original;
+    (tui as unknown as { compositeOverlays: Composite }).compositeOverlays = current.original;
     patched.delete(tui);
-    // The restored render changes the blanked lines back; request the pass
-    // that re-transmits the image.
+    try {
+      forgetUploads(tui, current.hidden);
+    } catch {
+      // Best effort: at worst a hidden kitty image stays missing until pi re-sends it.
+    }
+    // The restored method stops blanking; request the pass that restores the image.
     tui.requestRender();
   };
 }

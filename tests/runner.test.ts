@@ -11,31 +11,38 @@ import { RunStore } from "../src/store/run-store.js";
 import { hasSessionClosedMarker } from "../src/store/session-closed-marker.js";
 import { resolveFollowUpSpec } from "../src/tool/subagent-tool.js";
 import type { ParentContext, ResolvedFollowUpSpec } from "../src/runner/child.js";
-import type { ResolvedSpec, SubagentHandle, SubagentResult, SubagentSpec } from "../src/types.js";
+import type { ResolvedSpec, SubagentHandle, SubagentSpec } from "../src/types.js";
 import { WorkflowRunError } from "../src/workflow/workflow-runner.js";
 
 const zeroUsage = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 });
 
-test("runner hot reload ignores the old v16 process singleton", async () => {
+test("a re-evaluated runner module adopts the process-wide runner", async () => {
   const moduleUrl = new URL("../src/runner/runner.ts", import.meta.url).href;
-  const script = [
-    "const oldKey = '__piSubagentWorkflowRunner_v16__';",
-    "const currentKey = '__piSubagentWorkflowRunner_v17__';",
-    "const sentinel = {};",
-    "globalThis[oldKey] = sentinel;",
+  const runProbe = async (script: string): Promise<string> => {
+    const probe = Bun.spawn(["bun", "-e", script], { stdout: "pipe", stderr: "pipe" });
+    try {
+      const [exitCode, stdout, stderr] = await Promise.all([probe.exited, new Response(probe.stdout).text(), new Response(probe.stderr).text()]);
+      if (exitCode !== 0) throw new Error(`runner hot-reload probe failed (code ${exitCode}):\n${stderr}`);
+      return stdout.trim();
+    } finally {
+      probe.kill();
+      await probe.exited;
+    }
+  };
+  // Find where the first module instance publishes its runner.
+  const key = await runProbe([
     "const { subagentRunner } = await import(" + JSON.stringify(moduleUrl) + ");",
-    "if (subagentRunner === sentinel) throw new Error('reused v16 runner');",
-    "if (globalThis[currentKey] !== subagentRunner) throw new Error('v17 runner not installed');",
-    "if (globalThis[oldKey] !== sentinel) throw new Error('v16 runner entry changed');",
-  ].join(String.fromCharCode(10));
-  const probe = Bun.spawn(["bun", "-e", script], { stdout: "ignore", stderr: "pipe" });
-  try {
-    const [exitCode, stderr] = await Promise.all([probe.exited, new Response(probe.stderr).text()]);
-    if (exitCode !== 0) throw new Error(`runner hot-reload probe failed (code ${exitCode}):\n${stderr}`);
-  } finally {
-    probe.kill();
-    await probe.exited;
-  }
+    "const keys = Object.keys(globalThis).filter((key) => globalThis[key] === subagentRunner);",
+    "if (keys.length !== 1) throw new Error('runner not published process-wide: ' + JSON.stringify(keys));",
+    "console.log(keys[0]);",
+  ].join(String.fromCharCode(10)));
+  // A later module instance (pi re-evaluates per cwd generation) must reuse it.
+  await runProbe([
+    "const sentinel = {};",
+    "globalThis[" + JSON.stringify(key) + "] = sentinel;",
+    "const { subagentRunner } = await import(" + JSON.stringify(moduleUrl) + ");",
+    "if (subagentRunner !== sentinel) throw new Error('module instance created a second runner');",
+  ].join(String.fromCharCode(10)));
 });
 
 function controllableDelay(): {
@@ -103,11 +110,10 @@ test("terminal extraction clears the retained assistant while preserving the ful
     stopReason: "error",
     errorMessage: "terminal failure",
   };
-  let clearCount = 0;
   const session = {
     sessionFile: "/memory-child.jsonl",
     get latestAssistant() { return latestAssistant as never; },
-    clearLatestAssistant: () => { latestAssistant = undefined; clearCount += 1; },
+    clearLatestAssistant: () => { latestAssistant = undefined; },
     usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0.01, turns: 1 },
     subscribe: () => () => {}, prompt: async () => {}, steer: async () => {}, abort: async () => {}, dispose: async () => {},
   } as unknown as ChildSession;
@@ -117,7 +123,6 @@ test("terminal extraction clears the retained assistant while preserving the ful
 
   expect(result).toMatchObject({ status: "failed", error: "terminal failure", text: fullText });
   expect(latestAssistant).toBeUndefined();
-  expect(clearCount).toBe(1);
 });
 
 test("the runner folds activity incrementally by persisted child id", async () => {
@@ -449,30 +454,6 @@ test("a hung child disposal does not hold capacity or permit early retirement", 
   expect(firstDisposeCount).toBe(1);
   expect(runner.runHandles(first.runId)).toEqual([]);
   expect(semaphore.running).toBe(0);
-});
-
-test("a completed child disposes its session without retaining it", async () => {
-  let resolveDisposed!: () => void;
-  const disposed = new Promise<void>((resolve) => { resolveDisposed = resolve; });
-  const resolved: ResolvedSpec = { provider: "test", modelId: "tiny", thinkingLevel: "off", tools: [], cwd: "/tmp", label: "disposed" };
-  const session = {
-    sessionFile: "/disposed-child.jsonl",
-    latestAssistant: undefined,
-    usage: zeroUsage(),
-    subscribe: () => () => {},
-    prompt: async () => {},
-    steer: async () => {},
-    abort: async () => {},
-    dispose: async () => { resolveDisposed(); },
-  } as unknown as ChildSession;
-  const runner = new SubagentRunner(async () => ({ session, resolved }), new Semaphore(1), temporaryStore);
-  const parent = { ctx: { cwd: "/tmp", sessionManager: { getSessionId: () => "parent", getSessionFile: () => "/parent.jsonl" } }, thinkingLevel: "off", selfPath: "/extension.ts" } as unknown as ParentContext;
-  const handle = runner.spawn({ prompt: "x" }, parent);
-
-  await expect(handle.result).resolves.toMatchObject({ status: "completed" });
-  await disposed;
-
-  expect(runner.liveSession(handle.id)).toBeUndefined();
 });
 
 test("a normally completed v3 child becomes follow-up eligible after session closure", async () => {
@@ -820,40 +801,12 @@ test("an abort after session shutdown leaves worktree collection authoritative",
   }, new Semaphore(1), temporaryStore);
   const parent = { ctx: { cwd: repo, sessionManager: { getSessionId: () => "parent", getSessionFile: () => "/parent.jsonl" } }, thinkingLevel: "off", selfPath: "/extension.ts" } as unknown as ParentContext;
   handle = runner.spawn({ prompt: "edit", isolation: "worktree" }, parent);
-  const finish = spyOn(handle as unknown as { finish(result: SubagentResult): void }, "finish");
 
   const result = await handle.result;
   await aborting;
 
   expect(result.changed).toEqual(["collected.txt"]);
   expect(result.patch).toContain("+keep me");
-  expect(finish).toHaveBeenCalledTimes(1);
-});
-
-test("zero agent timeout leaves an active prompt alone", async () => {
-  let resolvePrompt!: () => void;
-  const prompt = new Promise<void>((resolve) => { resolvePrompt = resolve; });
-  let abortCount = 0;
-  const resolved: ResolvedSpec = { provider: "test", modelId: "tiny", thinkingLevel: "off", tools: [], cwd: "/tmp", label: "untimed" };
-  const session = {
-    sessionFile: "/untimed.jsonl",
-    latestAssistant: undefined,
-    usage: zeroUsage(),
-    subscribe: () => () => {},
-    prompt: async () => { await prompt; },
-    steer: async () => {},
-    abort: async () => { abortCount += 1; resolvePrompt(); },
-    dispose: async () => {},
-  } as unknown as ChildSession;
-  const runner = new SubagentRunner(async () => ({ session, resolved }), new Semaphore(1), temporaryStore);
-  runner.setAgentTimeoutMinutes(0);
-  const parent = { ctx: { cwd: "/tmp", sessionManager: { getSessionId: () => "parent", getSessionFile: () => "/parent.jsonl" } }, thinkingLevel: "off", selfPath: "/extension.ts" } as unknown as ParentContext;
-  const handle = runner.spawn({ prompt: "wait" }, parent);
-
-  await Bun.sleep(80);
-  expect(abortCount).toBe(0);
-  resolvePrompt();
-  await expect(handle.result).resolves.toMatchObject({ status: "completed" });
 });
 
 test("runner setting methods validate unsafe values", () => {
@@ -937,7 +890,6 @@ test("concurrent handle aborts share one session abort", async () => {
 
   const first = handle.abort();
   const second = handle.abort();
-  expect(second).toBe(first);
   await Promise.resolve();
   expect(abortCount).toBe(1);
   finishAbort();

@@ -20,10 +20,6 @@ test("workflow VM deep-freezes args and supports top-level return", async () => 
   expect(await executeWorkflowBody("return [Object.isFrozen(args), Object.isFrozen(args.nested)]", "args", api)).toEqual([true, true]);
 });
 
-test("workflow VM exposes no advisory budget global", async () => {
-  expect(await executeWorkflowBody("return typeof budget", "no-budget", api)).toBe("undefined");
-});
-
 test("workflow VM makes authored error stack frames unavailable", async () => {
   const result = await executeWorkflowBody(`
     let limitLocked = false;
