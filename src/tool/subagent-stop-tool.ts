@@ -32,7 +32,9 @@ export function registerSubagentStopTool(pi: ExtensionAPI, runner: SubagentRunne
         return {
           content: [{ type: "text", text: JSON.stringify(stopped.status === "already-finished"
             ? { ...stopped, note: "It had already finished its work before the stop arrived; its result is delivered as usual." }
-            : stopped) }],
+            : stopped.status === "terminated"
+              ? { ...stopped, note: "It ignored the stop and was killed. Its failed result still arrives with a respawn hint; do not respawn it unless the user asks." }
+              : stopped) }],
           details: undefined,
         };
       } catch (error) {
